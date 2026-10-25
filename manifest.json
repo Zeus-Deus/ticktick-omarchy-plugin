@@ -1,0 +1,183 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.sotoaugusto.ticktick",
+  "name": "TickTick",
+  "version": "0.5.2",
+  "author": "Augusto Soto",
+  "description": "TickTick tasks, habits and a focus timer in your bar — add, edit and complete without leaving the desktop",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "TickTick",
+    "description": "What is due today, habit check-ins, and a focus timer",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showTasks": true,
+      "showHabits": true,
+      "includeOverdue": true,
+      "horizon": "Today",
+      "maxTasks": 12,
+      "barLabel": "Count",
+      "notifyOnDue": false,
+      "notifyLeadMinutes": 0,
+      "undoSeconds": 6,
+      "showPomo": true,
+      "pomoMinutes": 0,
+      "shortBreakMinutes": 0,
+      "longBreakMinutes": 0,
+      "longBreakInterval": 0,
+      "syncInterval": "5 minutes"
+    },
+    "schema": [
+      {
+        "key": "syncInterval",
+        "type": "enum",
+        "label": "Background sync",
+        "description": "How often the bar count refreshes on its own. Opening the panel always syncs, so this only governs the idle case. Every tick costs five requests, and a bar exists per monitor.",
+        "options": [
+          "2 minutes",
+          "5 minutes",
+          "15 minutes",
+          "1 hour",
+          "Only when opened"
+        ],
+        "defaultValue": "5 minutes"
+      },
+      {
+        "key": "horizon",
+        "type": "enum",
+        "label": "Task horizon",
+        "description": "Which due dates count as \"up next\" in the panel and the bar count.",
+        "options": [
+          "Today",
+          "Tomorrow",
+          "Next 7 days"
+        ],
+        "defaultValue": "Today"
+      },
+      {
+        "key": "includeOverdue",
+        "type": "boolean",
+        "label": "Include overdue",
+        "description": "Count and list tasks whose due date has already passed.",
+        "defaultValue": true
+      },
+      {
+        "key": "showTasks",
+        "type": "boolean",
+        "label": "Show tasks",
+        "defaultValue": true
+      },
+      {
+        "key": "showHabits",
+        "type": "boolean",
+        "label": "Show habits",
+        "defaultValue": true
+      },
+      {
+        "key": "maxTasks",
+        "type": "integer",
+        "label": "Max tasks listed",
+        "description": "The panel scrolls past this; the cap keeps a 200-task day from becoming a 200-row popup.",
+        "min": 3,
+        "max": 50,
+        "step": 1,
+        "defaultValue": 12
+      },
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Bar label",
+        "description": "Count shows the number due, Next shows the next task's title, Icon shows nothing but the glyph.",
+        "options": [
+          "Count",
+          "Next",
+          "Icon"
+        ],
+        "defaultValue": "Count"
+      },
+      {
+        "key": "notifyOnDue",
+        "type": "boolean",
+        "label": "Notify when a task is due",
+        "description": "Send a desktop notification the moment a task's time arrives. Tasks with a date but no time are never announced — their due time is midnight. Needs notify-send on your PATH, and reminders are only as fresh as your background sync.",
+        "defaultValue": false
+      },
+      {
+        "key": "notifyLeadMinutes",
+        "type": "integer",
+        "label": "Notify this early (minutes)",
+        "description": "Announce a task ahead of its time rather than on it. 0 notifies at the moment itself.",
+        "min": 0,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 0
+      },
+      {
+        "key": "showPomo",
+        "type": "boolean",
+        "label": "Show focus timer",
+        "description": "Pomodoro section in the panel, and a live countdown in the bar while a block runs.",
+        "defaultValue": true
+      },
+      {
+        "key": "undoSeconds",
+        "type": "integer",
+        "label": "Undo window (seconds)",
+        "description": "How long a completion or check-in is held before it is sent. 0 sends immediately with no undo.",
+        "min": 0,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 6
+      },
+      {
+        "key": "pomoMinutes",
+        "type": "integer",
+        "label": "Focus length (minutes)",
+        "description": "0 follows your TickTick account setting.",
+        "min": 0,
+        "max": 180,
+        "step": 5,
+        "defaultValue": 0
+      },
+      {
+        "key": "shortBreakMinutes",
+        "type": "integer",
+        "label": "Short break (minutes)",
+        "description": "0 follows your TickTick account setting.",
+        "min": 0,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 0
+      },
+      {
+        "key": "longBreakMinutes",
+        "type": "integer",
+        "label": "Long break (minutes)",
+        "description": "0 follows your TickTick account setting.",
+        "min": 0,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 0
+      },
+      {
+        "key": "longBreakInterval",
+        "type": "integer",
+        "label": "Long break every N blocks",
+        "description": "0 follows your TickTick account setting.",
+        "min": 0,
+        "max": 12,
+        "step": 1,
+        "defaultValue": 0
+      }
+    ]
+  }
+}

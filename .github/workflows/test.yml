@@ -1,0 +1,34 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Plain Model.js helpers and extracted Service.qml handoff handlers.
+      - name: JavaScript tests
+        run: node --test tests/*.test.js
+
+      # The recurring-completion paths of the CLI, against a fake session: no
+      # credentials read, nothing sent to TickTick.
+      - name: CLI tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: CLI compiles
+        run: python3 -m py_compile bin/omarchy-ticktick
+
+      - name: Manifest is valid JSON
+        run: python3 -c 'import json; json.load(open("manifest.json"))'
