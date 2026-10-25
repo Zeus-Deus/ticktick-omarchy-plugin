@@ -1326,6 +1326,10 @@ function heldSuffix(count) {
 
 function parseCache(text) {
   var empty = {
+    backend: "v2",
+    authMethod: "",
+    capabilities: {},
+    warnings: [],
     syncedAt: 0,
     inboxId: "",
     projects: [],
@@ -1345,6 +1349,11 @@ function parseCache(text) {
     var parsed = JSON.parse(text)
     if (!parsed || typeof parsed !== "object") return empty
     return {
+      backend: parsed.backend === "openapi" ? "openapi" : "v2",
+      authMethod: String(parsed.authMethod || ""),
+      capabilities: parsed.capabilities && typeof parsed.capabilities === "object" && !Array.isArray(parsed.capabilities)
+        ? parsed.capabilities : {},
+      warnings: Array.isArray(parsed.warnings) ? parsed.warnings.filter(function(value) { return typeof value === "string" }) : [],
       syncedAt: Number(parsed.syncedAt || 0),
       inboxId: String(parsed.inboxId || ""),
       projects: parsed.projects || [],

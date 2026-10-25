@@ -1,8 +1,49 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+### Added
+
+- Browser OAuth onboarding through **Connect TickTick**: provider-supported
+  native public-client registration, PKCE S256 and a bounded loopback callback,
+  followed by connection validation and initial sync. No embedded client secret,
+  browser-cookie import or installed-app login extraction.
+- `login --oauth`, sanitized `--json-events` progress and the advanced official
+  access-token fallback over stdin (`login --api-token-stdin`). Browser progress,
+  cancellation, retry and reconnect are owned by the shared service.
+- A native **Quick add list** dropdown for official connections. Creation needs
+  a user-selected accessible list (`--project` in the CLI); no inbox ID is guessed.
+- Local outbox inspection and explicitly confirmed `outbox discard-reviewed`
+  recovery. Only review-marked intent is removed; ordinary queued work is
+  preserved, and the command never retries a provider write.
+
+### Changed
+
+- New OAuth and API-token sessions use the official Open API for tasks, tags,
+  habits/check-ins and focus records. Existing cookie sessions retain the legacy
+  private backend; **Open TickTick** launches the app/website independently of
+  plugin authorization. Unavailable endpoints surface errors/warnings, not a
+  silent fallback to private requests.
+- Official supported RRULE completion uses the provider's `/complete` endpoint
+  and server-side rollover, not legacy client-side date arithmetic. Unsupported
+  rules are refused. Daily rollover was verified for both `repeatFrom=1` and
+  `repeatFrom=2`, not every recurrence combination.
+- Official task IDs come from the provider. Uncertain task/focus creations and
+  recurring completions are retained for review, never automatically replayed;
+  safe queued recurring completions check the original occurrence before replay.
+  Pending work remains bound to its original connection.
+- Official focus durations use plugin settings/defaults because focus preferences
+  are not exposed. Statistics derive from returned ended records, with pomodoro
+  counts and combined pomodoro/stopwatch duration; failed non-auth statistics
+  refreshes retain the cache with a warning.
+- OAuth does not add automatic renewal: expired or rejected authorization needs
+  reconnection. Credential ownership/mode checks, HTTPS/TLS verification and
+  redirect refusal remain in place without new Python dependencies.
 
 ### Fixed
+
+- The disconnected bar widget uses a muted TickTick mark instead of a plug
+  and "setup" label; setup remains available through its tooltip and click.
 
 - API requests require HTTPS and refuse redirects so session cookies and login
   bodies cannot be forwarded to another destination.
@@ -17,8 +58,8 @@
 - The service joins its CLI path with an explicit separator for Quickshell
   versions that resolve the plugin directory without a trailing slash.
 
-- Completing a recurring task rolls the series forward to its next
-  occurrence instead of ending the whole series.
+- Legacy recurring completion computes and sends the next occurrence instead
+  of ending the whole series; official sessions use server-side rollover as above.
 - The panel opens on today: late work no longer fills the list before
   today's tasks are reached. It sits under its own rule carrying the late
   count, newest slip first.

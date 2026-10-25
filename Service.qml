@@ -46,6 +46,16 @@ Item {
   readonly property string cli: pluginDir + "/bin/omarchy-ticktick"
   readonly property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy/ticktick"
 
+  function cliErrorMessage(raw) {
+    var text = String(raw || "").trim()
+    if (text === "") return ""
+    try {
+      var parsed = JSON.parse(text)
+      if (parsed && typeof parsed.error === "string") return Model.elide(parsed.error, 180)
+    } catch (_) {}
+    return "TickTick could not finish this request. Please try again."
+  }
+
   // ---- cache -------------------------------------------------------------
 
   property var cache: Model.parseCache("")
@@ -61,7 +71,18 @@ Item {
     printErrors: false
     onFileChanged: reload()
     onLoaded: {
-      root.cache = Model.parseCache(text())
+      var wasConnected = root.cache.syncedAt > 0 && !root.cache.authRequired
+      var next = Model.parseCache(text())
+      root.cache = next
+      // A terminal/browser login can finish outside this service's Process.
+      // Clear its old signed-out error, without hiding ordinary write errors.
+      if (!wasConnected && next.syncedAt > 0 && !next.authRequired && !next.error) {
+        root.actionError = ""
+        if (!root.oauthConnecting && !root.connecting) {
+          root.authState = "idle"
+          root.authError = ""
+        }
+      }
       // The write that lands here is the authority on what is still open, so
       // optimistic rows stop being needed the moment it arrives.
       root.pendingIds = ({})
@@ -99,7 +120,7 @@ Item {
   // just completed is not repeated.
   function refresh(force) {
     nowDate = new Date()
-    if (syncProc.running) return
+    if (syncProc.running || root.oauthConnecting) return
     syncProc.command = force === false
       ? [root.cli, "sync", "--max-age", String(Math.max(30, refreshIntervalSec - 15))]
       : [root.cli, "sync"]
@@ -112,8 +133,8 @@ Item {
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var raw = String(text || "").trim()
-        if (raw !== "") root.actionError = Model.elide(raw, 120)
+        var raw = root.cliErrorMessage(text)
+        if (raw !== "") root.actionError = raw
       }
     }
     onExited: function(code) {
@@ -154,7 +175,7 @@ Item {
     id: actionProc
     stdinEnabled: true
     onStarted: {
-      if (command.indexOf("--token-stdin") < 0) return
+      if (command.indexOf("--token-stdin") < 0 && command.indexOf("--api-token-stdin") < 0) return
       var token = root.loginToken
       root.loginToken = ""
       write(token + "\n")
@@ -162,9 +183,17 @@ Item {
     onRunningChanged: {
       if (running) return
       // Also covers failure to start, which emits no exited signal.
-      if (command.indexOf("--token-stdin") >= 0) {
+      if (command.indexOf("--token-stdin") >= 0 || command.indexOf("--api-token-stdin") >= 0) {
         root.loginToken = ""
         root.connecting = false
+      }
+      if (command.indexOf("--api-token-stdin") >= 0) {
+        Qt.callLater(function() {
+          if (!actionProc.running && root.authState === "validating") {
+            root.authState = "failed"
+            root.authError = "Could not start TickTick sign-in. Please try again."
+          }
+        })
       }
       // A failed preceding action must not strand a queued login/token.
       root.drainQueue()
@@ -172,15 +201,19 @@ Item {
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var raw = String(text || "").trim()
-        if (raw !== "") root.actionError = Model.elide(raw, 120)
+        var raw = root.cliErrorMessage(text)
+        if (raw !== "") root.actionError = raw
       }
     }
     onExited: function(code) {
       if (code === 0) root.actionError = ""
-      if (command.indexOf("--token-stdin") >= 0) {
+      if (command.indexOf("--token-stdin") >= 0 || command.indexOf("--api-token-stdin") >= 0) {
         root.loginToken = ""
         root.connecting = false
+      }
+      if (command.indexOf("--api-token-stdin") >= 0) {
+        root.authState = code === 0 ? "idle" : "failed"
+        root.authError = code === 0 ? "" : (root.actionError || "TickTick could not connect. Please try again.")
       }
       // Same reasoning as syncProc: a login, complete, add, etc. just wrote
       // data.json, and the watcher may never have attached (see there).
@@ -328,6 +361,17 @@ Item {
   function submitQuickAdd(text) {
     var args = Model.quickAddArgs(text)
     if (!args) return null
+    if (root.cache.backend === "openapi") {
+      var project = String(setting("defaultProject", ""))
+      var available = (root.cache.projects || []).some(function(item) {
+        return String(item.id) === project && !item.closed
+      })
+      if (!project || !available) {
+        root.actionError = "Choose a quick add list first."
+        return null
+      }
+      args = args.concat(["--project", project])
+    }
     pendingAdds = pendingAdds.concat([{ id: "", title: args[1], ghost: true }])
     runAction(args)
     return Model.parseQuickAdd(text)
@@ -664,16 +708,171 @@ Item {
 
   property bool connecting: false
   property string loginToken: ""
+  property string authState: "idle"
+  property string authError: ""
+  property string authUrl: ""
+  signal launching()
+  property bool oauthRequested: false
+  property bool oauthHandled: false
+  property bool oauthCancelled: false
+  property bool oauthSucceeded: false
+  property int oauthGeneration: 0
+  readonly property bool oauthConnecting: oauthRequested || oauthProc.running
 
-  function connectWithToken(token) {
-    if (connecting) return
+  function connectWithToken(token, official) {
+    if (connecting || root.oauthConnecting) return
     var trimmed = String(token || "").trim()
     if (trimmed === "") return
     connecting = true
     actionError = ""
     loginToken = trimmed
-    // Only a flag enters argv/the action queue. The token goes directly to
-    // the child's stdin after it starts; no asynchronous file to leave behind.
-    runAction(["login", "--token-stdin"])
+    if (official === true) {
+      authState = "validating"
+      authError = ""
+    }
+    // Only a flag enters argv/the action queue; the secret goes to stdin.
+    runAction(["login", official === true ? "--api-token-stdin" : "--token-stdin"])
+  }
+
+  function connectWithApiToken(token) {
+    root.connectWithToken(token, true)
+  }
+
+  function startOAuth() {
+    if (root.oauthConnecting || root.connecting) return
+    root.oauthGeneration += 1
+    root.authState = "preparing"
+    root.authError = ""
+    root.actionError = ""
+    root.authUrl = ""
+    root.oauthCancelled = false
+    root.oauthHandled = false
+    root.oauthSucceeded = false
+    root.oauthRequested = true
+    root.launchOAuthWhenIdle()
+  }
+
+  function launchOAuthWhenIdle() {
+    if (!root.oauthRequested || syncProc.running || actionProc.running || root.actionQueue.length > 0) return
+    oauthProc.command = [root.cli, "login", "--oauth", "--json-events"]
+    oauthProc.running = true
+    root.oauthRequested = false
+  }
+
+  function handleOAuthEvent(line) {
+    if (root.oauthCancelled || root.oauthHandled || root.authState === "failed") return
+    var event
+    try { event = JSON.parse(String(line || "")) } catch (_) { return }
+    if (!event || typeof event.phase !== "string") return
+    if (event.phase === "preparing" || event.phase === "validating") {
+      root.authState = event.phase
+      if (event.phase === "validating") root.authUrl = ""
+    } else if (event.phase === "waiting") {
+      var url = String(event.url || "")
+      if (url.length > 8192 || !/^https:\/\/ticktick\.com\/oauth\/authorize\?[^\s#]+$/.test(url)) {
+        root.authState = "failed"
+        root.authError = "TickTick returned an unexpected sign-in address. Please try again."
+        root.authUrl = ""
+        oauthProc.signal(15)
+        return
+      }
+      var first = root.authUrl !== url
+      root.authUrl = url
+      root.authState = "waiting"
+      if (first) root.reopenAuthPage()
+    } else if (event.phase === "connected" && event.ok === true) {
+      root.oauthSucceeded = true
+      root.authState = "validating"
+    } else if (event.phase === "error") {
+      root.authState = "failed"
+      root.authUrl = ""
+      root.authError = Model.elide(String(event.message || "TickTick could not finish sign-in. Please try again."), 240)
+    }
+  }
+
+  function reopenAuthPage() {
+    if (root.authState !== "waiting" || root.authUrl === "") return
+    var url = root.authUrl
+    // The user may have reopened a panel while registration was preparing.
+    // Let every panel release its keyboard before showing the browser.
+    root.launching()
+    Qt.callLater(function() {
+      if (root.authState !== "waiting" || root.authUrl !== url || root.oauthCancelled) return
+      if (!Qt.openUrlExternally(url)) {
+        root.authState = "failed"
+        root.authError = "Could not open your browser. Please try again."
+        root.authUrl = ""
+        oauthProc.signal(15)
+      }
+    })
+  }
+
+  function cancelOAuth() {
+    root.oauthCancelled = true
+    root.oauthRequested = false
+    root.authState = "idle"
+    root.authError = ""
+    root.authUrl = ""
+    if (oauthProc.running) oauthProc.signal(15)
+  }
+
+  function finishOAuth(code) {
+    if (root.oauthHandled) return
+    root.oauthHandled = true
+    root.oauthRequested = false
+    root.authUrl = ""
+    if (root.oauthCancelled) {
+      root.authState = "idle"
+      root.authError = ""
+    } else if (code === 0 && root.oauthSucceeded) {
+      root.authState = "idle"
+      root.authError = ""
+      root.actionError = ""
+      root.dataFile.reload()
+    } else {
+      root.authState = "failed"
+      if (root.authError === "") root.authError = "TickTick could not finish sign-in. Please try again."
+    }
+  }
+
+  // A sign-in can wait for minutes. It must not occupy the mutation pipe.
+  Process {
+    id: oauthProc
+    onRunningChanged: {
+      if (!running && root.authState !== "idle") {
+        var generation = root.oauthGeneration
+        Qt.callLater(function() {
+          if (generation === root.oauthGeneration && !oauthProc.running && !root.oauthHandled) root.finishOAuth(-1)
+        })
+      }
+    }
+    stdout: SplitParser {
+      onRead: function(line) { root.handleOAuthEvent(line) }
+    }
+    stderr: SplitParser {
+      // Only the CLI's sanitized progress events reach the UI.
+      onRead: function(line) {}
+    }
+    onExited: function(code) { root.finishOAuth(code) }
+  }
+
+  Timer {
+    interval: 100
+    repeat: true
+    running: root.oauthRequested
+    onTriggered: root.launchOAuthWhenIdle()
+  }
+
+  Timer {
+    // Callback wait (180s), bounded provider HTTP, then initial cache validation.
+    interval: 300000
+    running: root.oauthConnecting
+    onTriggered: {
+      root.oauthRequested = false
+      root.authState = "failed"
+      root.authError = "Sign-in timed out. Please try again."
+      root.authUrl = ""
+      if (oauthProc.running) oauthProc.signal(15)
+    }
   }
 }

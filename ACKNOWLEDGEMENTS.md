@@ -1,9 +1,15 @@
 # Acknowledgements
 
-No third-party code is vendored into this plugin. What follows is what it was
-built on, learned from, or runs inside — including cases where the debt is
-knowledge rather than code, since those are the ones that are easy to leave
-unsaid.
+No third-party runtime libraries are bundled. What follows is what this plugin
+was built on, learned from, or runs inside, plus the small icon asset it uses.
+
+## TickTick mark
+
+The monochrome geometry in `TickTickIcon.qml` comes from
+[Simple Icons' TickTick icon](https://github.com/simple-icons/simple-icons/blob/develop/icons/ticktick.svg),
+distributed under [CC0-1.0](https://github.com/simple-icons/simple-icons/blob/develop/LICENSE.md).
+It is rendered locally with the current Omarchy foreground color; there is no
+runtime icon download. TickTick remains its owner's trademark.
 
 ## Runs inside
 

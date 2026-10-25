@@ -6,9 +6,13 @@ publication history rather than copying upstream development-session metadata. T
 and state directory stay unchanged so existing settings and sessions remain compatible.
 See [the changelog](CHANGELOG.md) for the credential-handling changes.
 
-This is still an unofficial plugin using TickTick's undocumented API. Regression
-tests cover the hardening, but are not a guarantee of whole-plugin security or
-live-service compatibility.
+This is an unofficial plugin. New browser OAuth and API-token connections use
+TickTick's official Open API; existing browser-cookie sessions retain the
+undocumented legacy backend. Regression tests are not a guarantee of
+whole-plugin security or live-service compatibility.
+
+Version 0.6.0 adds browser authorization without manual cookie copying while
+preserving existing legacy connections and settings.
 
 **What's due and what you haven't done yet, in the Omarchy bar.** Tasks,
 habits and a focus timer in one popup — add, edit and complete without
@@ -33,8 +37,9 @@ turns urgent when something is late. Left click opens the panel.
   it is sent, so a misclick costs nothing
 - **Due notifications** — an optional desktop notification the moment a task's
   time arrives, batched so five o'clock is one popup and not five
-- **Focus timer** — a pomodoro that uses your TickTick durations, counts down
-  in the bar, and uploads each finished block to your focus statistics
+- **Focus timer** — a local pomodoro that counts down in the bar and uploads
+  finished blocks; official connections use plugin/default durations, while
+  legacy sessions can read your TickTick focus preferences
 - Fully keyboard driven, with an in-panel shortcut list
 - Tag colours come straight from TickTick; due state follows your Omarchy theme
 - Everything is theme aware and follows the bar's vertical/horizontal layout
@@ -57,34 +62,42 @@ No external Python packages, no build step, and nothing is compiled.
 omarchy plugin add https://github.com/Zeus-Deus/ticktick-omarchy-plugin.git --enable --yes
 ```
 
-Then click the widget in the bar. It shows a plug icon until it is
-connected, and clicking it opens a setup card with three steps and a paste
-field:
+Then click the widget in the bar. While disconnected it shows only a muted
+TickTick mark; setup instructions are in its tooltip. Clicking it opens the
+setup card:
 
-1. Open `ticktick.com` and sign in
-2. `F12` → **Application** → **Cookies** → `https://ticktick.com`
-3. Copy the value of the cookie named **`t`**, paste it, press Connect
+1. Choose **Connect TickTick**. The panel closes and your default browser opens
+   TickTick's authorization page.
+2. Sign in on TickTick and approve access. The plugin receives a local callback,
+   validates the connection and performs its initial sync.
+3. Reopen the panel and select an accessible **Quick add list** from the dropdown
+   before adding tasks. If none are available, create a list in TickTick first.
 
-That is the whole setup. The field is masked, and the token is handed to the
-CLI over stdin, never through command-line arguments or a temporary paste
-file. The pending token is cleared after the child starts or fails to start.
-Nothing reads your browser.
+The service owns sign-in even while the popup is closed. Reopen it to see
+progress, reopen the authorization page, cancel, or retry after a failure.
+The callback wait is bounded to three minutes.
 
-Why a cookie and not a password: see [About the API](#about-the-api). Short
-version — TickTick's risk control rejects scripted password logins, so the
-browser session is the reliable path.
+This is browser authorization, not extraction of an installed app's login.
+**Open TickTick** is separate: it tries the installed app, then the website;
+signing in there does not connect this plugin. No browser cookies or desktop
+account files are imported by OAuth.
 
-If you would rather stay in a terminal:
+The terminal equivalent is:
 
 ```bash
-~/.config/omarchy/plugins/io.github.sotoaugusto.ticktick/bin/omarchy-ticktick login --token -
+~/.config/omarchy/plugins/io.github.sotoaugusto.ticktick/bin/omarchy-ticktick login --oauth
 ```
 
-`--token -` prompts with the input hidden, so the credential stays out of
-your shell history.
+For the advanced fallback, expand **Use an API token instead** and paste an
+official access token created in TickTick's **Settings › Account › API Token**.
+The field is masked and cleared; the CLI receives the token through stdin
+(`login --api-token-stdin`), not argv or a temporary paste file. Treat the token
+like a password and revoke it in TickTick if it leaks.
 
-When the token eventually expires, the panel returns to the same card and
-says so. Reconnecting is the same paste.
+There is no automatic token renewal. When authorization expires or is rejected,
+use **Reconnect TickTick** to authorize again. Pending changes remain tied to
+their original connection: sync or review them before switching credentials;
+they are not silently migrated to a new OAuth session.
 
 ## Removal
 
@@ -108,42 +121,58 @@ sessions are deleted by uninstalling.
 
 ## About the API
 
-TickTick's documented Open API (v1, OAuth) has **no habits endpoint at all**.
-It covers projects and tasks and nothing else. This plugin therefore speaks
-the same private v2 API the TickTick web app uses, authenticated with a
-session token.
+The documented Open API includes projects, tasks, tags, habits/check-ins and
+focus records. Browser OAuth uses provider-supported dynamic registration of
+a native public client, PKCE S256 and a loopback callback on `127.0.0.1` with
+an ephemeral port. No embedded client secret or developer-app setup is needed.
+The callback checks the state and issuer before the code is exchanged.
 
-That is a deliberate trade and you should know what you are taking on:
+| Behaviour | Official OAuth / API token | Legacy browser cookie |
+|---|---|---|
+| Authentication | Bearer access token; `login --oauth` or `login --api-token-stdin` | Existing session, or explicit `login --token -` |
+| Tasks and habits | Official endpoints, including habit check-ins | Undocumented v2 endpoints |
+| Quick add | Choose an accessible list; CLI requires `--project` | Defaults to the discovered inbox |
+| Recurring completion | Supported RRULEs use the official `/complete` endpoint; TickTick advances the series | Plugin computes the next occurrence and sends a v2 batch |
+| Focus preferences | Not exposed; use plugin overrides/defaults | Read from account preferences |
+| Focus statistics | Derived from returned, ended focus records | Legacy account statistics |
+| Uncertain writes | Non-idempotent operations are retained for review, not automatically replayed | Client-ID-based replay for supported queued writes |
 
-- It is undocumented. TickTick can change or break it without notice.
-- Scripted password login is unreliable and risky. `/api/v2/user/signon`
-  answers a *correct* password with `username_password_not_match` when its
-  risk control does not recognise the client, and repeated attempts get the
-  account flagged. Use the browser token.
-- The edge rejects requests that imitate the web app too closely. Sending
-  `Origin`/`Referer`, or the full `x-device` object from TickTick's own
-  bundle, returns `access_forbidden`; a minimal `x-device` is what works.
-- No password is written to disk. Only the session token is, at
-  `~/.local/state/omarchy/ticktick/session.json`, mode 0600. Existing state
-  directories are checked for current-user ownership and tightened to 0700
-  before access; symlinks in the storage path are refused. Atomic temporary
-  files are created privately, not chmodded after the secret has been written.
-- API requests require HTTPS and never follow redirects, including same-host
-  redirects. TLS verification, timeouts, and response-size limits remain on.
-- The panel uses `login --token-stdin`. Legacy `--token-file` callers must use
-  an owned, private regular file directly inside the credential directory;
-  it is bounded to 4096 bytes and removed before login is attempted, even
-  when validation fails. Prefer `login --token -` in a terminal; never put a
-  literal token in your command line.
-- `/api/v2/user/signin` — the path several published wrappers still use — is
-  a dead 404. The live one is `/user/signon`.
+Endpoint availability can differ by account or authorization. A 403/404 may
+mean a capability is unavailable; the panel exposes errors or warnings rather
+than silently switching an official connection to private endpoints. A rejected
+credential requires reconnection. Neither backend renews credentials automatically.
 
-Sessions expire eventually. When one does the panel returns to its setup card
-and asks for a fresh token. There is no automatic renewal: it would need a
-stored password, and TickTick refuses scripted password logins anyway, so the
-machinery would sit there unable to do the one thing it exists for.
+Credentials are stored at `~/.local/state/omarchy/ticktick/session.json`, mode
+0600. State directories are checked for current-user ownership and tightened
+to 0700; symlinked storage paths are refused and atomic temporary files start
+private. No password is stored. OAuth tokens and codes are not placed in
+command-line arguments or diagnostics. Remote credential-bearing requests use
+HTTPS, verify TLS and refuse redirects; the HTTP callback is loopback-only.
+Timeouts and response-size limits remain enabled. No new Python dependencies
+are required.
 
-Using TickTick's Chinese service instead? Set `TICKTICK_DOMAIN=dida365.com`.
+### Legacy sessions
+
+Existing browser-cookie sessions remain compatible; they are not automatically
+converted to OAuth. To reconnect explicitly to this backend, sign in on
+`ticktick.com`, open browser developer tools → **Application → Cookies**, and
+copy the value of the **`t`** cookie. Paste it at the hidden terminal prompt:
+
+```bash
+omarchy-ticktick login --token -
+```
+
+This is a full-access session credential, not an official API token. Never put
+its literal value in argv. `login --token-stdin` also remains available for
+legacy callers. The older `--token-file` handoff requires an owned private
+regular file directly inside the credential directory, bounded to 4096 bytes;
+it is consumed before login, including when validation fails.
+
+The private API can change without notice. Scripted password login remains an
+explicit legacy fallback, but TickTick's risk control may reject valid credentials
+and repeated attempts can flag the account. Prefer OAuth, not repeated password
+attempts. `TICKTICK_DOMAIN=dida365.com` applies to the legacy service only;
+the official OAuth/Open API endpoints remain on TickTick.
 
 ## How it fits together
 
@@ -155,6 +184,7 @@ shell process, and every mutation is one command you can run yourself.
 
 ```
 bin/omarchy-ticktick   session, API calls, the JSON cache
+bin/ticktick_oauth.py  public-client registration, PKCE and local callback
 Model.js               task filtering, due labels, habit streaks (node-testable)
 Service.qml            everything that must exist once, not once per screen
 Panel.qml              the popup — a view of the service
@@ -189,12 +219,15 @@ pass `--max-age` so a sync another process just finished is not repeated.
 ### CLI
 
 ```bash
-omarchy-ticktick login --token -            # paste the browser's `t` cookie
-omarchy-ticktick login [--email ADDR]          # password fallback
+omarchy-ticktick login --oauth               # authorize in the default browser
+omarchy-ticktick login --api-token-stdin     # official access token via stdin
+omarchy-ticktick login --token -             # legacy browser `t` cookie, hidden prompt
+omarchy-ticktick login [--email ADDR]         # legacy password fallback; not recommended
 omarchy-ticktick sync [--scope tasks|habits|pomo|full]
-omarchy-ticktick add "Pay rent" --due today [--priority 0|1|3|5] [--tags work,ops]
-omarchy-ticktick update <taskId> [--title T] [--due D] [--priority P] [--tags a,b]
+omarchy-ticktick add "Pay rent" --project <projectId> --due today [--time HH:MM] [--priority 0|1|3|5] [--tags work,ops]
+omarchy-ticktick update <taskId> [--title T] [--due D] [--time HH:MM] [--priority P] [--tags a,b]
 omarchy-ticktick complete <taskId>
+omarchy-ticktick subtask <taskId> <itemId>    # toggle a checklist item
 omarchy-ticktick reopen <taskId>
 omarchy-ticktick delete <taskId>
 omarchy-ticktick checkin "Read" --toggle    # by name or id
@@ -202,11 +235,17 @@ omarchy-ticktick checkin "Water" --value 3
 omarchy-ticktick pomo status                # today's focus stats + settings
 omarchy-ticktick pomo log --minutes 50      # upload a finished focus block
 omarchy-ticktick status                     # cache state as JSON
+omarchy-ticktick outbox                     # inspect pending writes locally
+omarchy-ticktick outbox discard-reviewed --confirm  # only after checking TickTick
 omarchy-ticktick logout
 ```
 
-Every command prints JSON on stdout and errors on stderr, so it scripts and
-binds cleanly.
+Data and mutation commands print JSON on stdout and errors on stderr. Interactive
+OAuth/cookie/password login can print plain confirmation text; the panel uses
+`login --oauth --json-events` for sanitized newline-delimited JSON progress.
+`--api-token-stdin` reads stdin, not a hidden interactive prompt; use the masked
+panel fallback for manual pasting. `--project` is required for official creation,
+not inferred from an inbox ID. Both task time flags also accept `HH:MM-HH:MM`.
 
 ## Settings
 
@@ -219,6 +258,7 @@ Configure in Setup > Plugins, or inline on the bar entry in
 | `horizon` | `Today` | `Today`, `Tomorrow`, or `Next 7 days`. |
 | `includeOverdue` | `true` | Count and list work that is already late. |
 | `showTasks` | `true` | Show the task section. |
+| `defaultProject` | empty | Official quick-add destination, saved by the panel's **Quick add list** dropdown. |
 | `showHabits` | `true` | Show the habit section. |
 | `maxTasks` | `12` | Rows before the list is capped with a "+N more". |
 | `barLabel` | `Count` | `Count`, `Next` (next task's title, scrolling), or `Icon`. Right-click the widget to cycle it. |
@@ -226,10 +266,10 @@ Configure in Setup > Plugins, or inline on the bar entry in
 | `notifyLeadMinutes` | `0` | Notify this many minutes early instead. |
 | `showPomo` | `true` | Focus section, and a live countdown in the bar. |
 | `undoSeconds` | `6` | How long an action is held before sending. `0` disables undo. |
-| `pomoMinutes` | `0` | Focus length. `0` follows your TickTick account. |
-| `shortBreakMinutes` | `0` | Short break. `0` follows your account. |
-| `longBreakMinutes` | `0` | Long break. `0` follows your account. |
-| `longBreakInterval` | `0` | Long break every N blocks. `0` follows your account. |
+| `pomoMinutes` | `0` | Focus length. `0` uses plugin defaults for official connections, account preferences for legacy. |
+| `shortBreakMinutes` | `0` | Short break; same backend-dependent fallback. |
+| `longBreakMinutes` | `0` | Long break; same backend-dependent fallback. |
+| `longBreakInterval` | `0` | Long break every N blocks; same backend-dependent fallback. |
 
 ```json
 {
@@ -294,10 +334,10 @@ a place.
 node --test tests/*.test.js
 python3 -m unittest discover -s tests -p 'test_*.py'
 # Optional native Service/Process checks in an isolated Omarchy VM:
-TICKTICK_NATIVE_TESTS=1 python3 -m unittest discover -s tests -p test_service_native.py
+TICKTICK_NATIVE_TESTS=1 python3 -W error::ResourceWarning -m unittest discover -s tests -p 'test_*.py'
 ```
 
-CI runs the same suite on every push to `master` and every pull request,
+CI runs the same suite on every push to `main` or `master` and every pull request,
 along with a compile check of the CLI and a parse of `manifest.json`.
 
 `Model.js` holds every piece of logic that can be wrong without being
@@ -314,11 +354,12 @@ for 14:30:
 dbus-monitor --session "interface='org.freedesktop.Notifications',member='Notify'"
 ```
 
-With that running, add a task due a minute ago and force a sync — the call
-should appear once, and not again when the shell restarts:
+With that running, set `PROJECT_ID` to an accessible list's ID, add a task due
+a minute ago and force a sync — the call should appear once, and not again
+when the shell restarts:
 
 ```bash
-bin/omarchy-ticktick add "Test" --due today --time $(date -d '1 min ago' +%H:%M)
+bin/omarchy-ticktick add "Test" --project "${PROJECT_ID:?Set PROJECT_ID to an accessible list ID}" --due today --time $(date -d '1 min ago' +%H:%M)
 bin/omarchy-ticktick sync
 ```
 
@@ -342,13 +383,11 @@ Opening the panel always syncs, and so do the sync button and `r`, so this
 setting governs only the idle case — how fresh the bar's count is while you
 are not looking at it.
 
-Two things make a short list better than a free-form seconds box here. Each
-tick is five HTTP requests, and **a bar surface exists per monitor**, so a
-two-screen desktop fires the timer twice. To keep that from doubling the
-traffic, a timer-driven sync passes `--max-age`: whichever instance gets
-there first does the work, and the second sees a fresh cache and exits
-without a request. Explicit syncs never skip, and neither does a sync with
-anything queued in the outbox.
+The shared service owns the timer across monitors. A full sync takes several
+requests; the official backend also fetches each accessible project's data,
+so cost grows with the number of lists. Timer-driven syncs pass `--max-age`
+to avoid repeating a refresh another process just completed. Explicit syncs
+never skip, and neither does a sync with anything queued in the outbox.
 
 ```bash
 omarchy-ticktick sync --max-age 285   # what the timer runs
@@ -424,17 +463,17 @@ rather than having been quietly used up.
 
 ## Why writes feel immediate
 
-A write costs a sync, and a full sync is five HTTP round trips — about two
-seconds. Adding a task cannot change your habits, your check-ins, or your
-pomodoro settings, so re-fetching them afterwards spends most of that second
-confirming that nothing happened.
+A write costs a sync, and a full sync makes several HTTP requests. Adding a
+task cannot change your habits, check-ins or focus settings, so re-fetching
+every section afterwards does unnecessary work. Request counts and latency
+depend on the backend and the number of projects.
 
 Syncs are therefore scoped. A task write refreshes tasks only, a check-in
 refreshes habits only, and a finished focus block refreshes the pomodoro
 stats. Sections outside the scope keep their cached values.
 
 ```bash
-omarchy-ticktick sync --scope tasks     # ~0.6s, vs ~2.0s for full
+omarchy-ticktick sync --scope tasks     # leave habits and focus cache unchanged
 ```
 
 On top of that, a quick-added task appears in the list the moment you press
@@ -444,38 +483,53 @@ be completed by accident.
 
 ## Offline
 
-A write made while TickTick is unreachable is not lost and not silently
-dropped. It goes into an outbox at
-`~/.local/state/omarchy/ticktick/outbox.json`, and the change is applied to
-the local cache immediately — so the task appears in the list, the habit
-shows checked, and both survive a shell restart rather than living only in
-the panel's memory.
+Pending writes are stored privately in
+`~/.local/state/omarchy/ticktick/outbox.json`. Safe queued changes are reflected
+in the local cache and survive a shell restart. Sync attempts delivery before
+refreshing; the panel's cloud/count indicates pending entries, and clicking it
+retries eligible work. Not every pending entry is safe to retry.
 
-Every sync drains the queue before reading anything back, so what you get
-afterwards reflects your writes instead of contradicting them. The panel
-shows a cloud and a count while anything is waiting; clicking it retries.
+**Official backend:** task IDs are assigned by TickTick. Task creation, focus
+creation and recurring completion have no proven idempotent replay contract.
+If their outcome is uncertain, the entry is retained for review and is **not
+automatically replayed**. Check TickTick before manually repeating the action:
+it may already have succeeded. A retry click does not override this safeguard.
+An uncertain creation is not presented as a confirmed server task.
 
-This is safe to replay because **every write carries a client-generated id** —
-tasks, check-in entries, and pomodoro records alike. Sending a queued write
-twice updates the same record instead of creating a duplicate.
+Use `omarchy-ticktick outbox` to inspect pending intent without a network
+request. After checking TickTick and resolving those actions there, run
+`omarchy-ticktick outbox discard-reviewed --confirm` to remove only entries
+explicitly marked for review. This discards local retry intent, not server
+records; it cannot undo a write. Ordinary pending entries are preserved in
+order. Without `--confirm`, nothing is changed. Sync afterwards to refresh
+the cache; remaining ordinary pending work must still be resolved before
+switching connections or logging out.
 
-Replays resolve against current server state rather than being sent verbatim.
-A v2 update is a whole-object write, so a queued completion re-fetches the
-task and changes only its status; anything you edited on another device in
-the meantime survives. Queued check-ins re-query the day's entry before
-deciding whether to add or update it.
+Safe queued updates resolve against current server state. A recurring completion
+queued before sending compares the original occurrence's due date before replay;
+if the series has advanced elsewhere, it is retained for review rather than
+completing the next occurrence. Connection changes do not adopt another
+connection's pending work. An entry needing review can block later delivery;
+inspect the error and reconcile the pending work before reconnecting.
 
-A write that TickTick actively *rejects* is dropped rather than retried
-forever, since replaying a rejection only earns another rejection. A write
-that never got a verdict — no network, or a rate limit — is kept and retried.
-When the queue stalls, the remaining entries stay in order instead of each
-one hammering a dead network.
+**Legacy backend:** supported queued writes carry client-generated record IDs.
+Replay re-fetches a task before applying whole-object v2 updates, and check-ins
+re-query the day's entry. This is the legacy replay mechanism, not a guarantee
+for official creates. Active legacy rejections are dropped; transient failures
+remain queued. Official failures retain pending entries rather than silently
+discarding them. A stalled queue keeps remaining entries in order.
 
 ```bash
 omarchy-ticktick status     # includes the queued count
 ```
 
 ## Quick add
+
+On the official backend, choose **Quick add list** in the panel first. It lists
+accessible, open projects and remembers your selection. Creation is disabled
+until a valid list is selected; the plugin does not guess an inbox ID. The CLI
+equivalent is `add ... --project <projectId>`. Legacy quick add defaults to its
+discovered inbox.
 
 The field takes more than a title:
 
@@ -649,14 +703,23 @@ reversible.
 
 ### Recurring tasks
 
-TickTick does not roll a recurring task forward on its server. Its own web
-client does it in two writes: it adds a *new* task holding the finished
-occurrence, and updates the live series back to not-done with its dates moved
+**Official backend:** supported RRULE completions go through the documented
+`/project/{projectId}/task/{taskId}/complete` endpoint. TickTick advances the
+series server-side; the plugin does not apply legacy date arithmetic or create
+its own completed-occurrence copy. Unsupported rules are refused: finish those
+in TickTick instead. Isolated live QA verified daily rollover for `repeatFrom=1`
+and `repeatFrom=2`; that is not exhaustive verification of every recurrence.
+Uncertain results and offline occurrence checks follow the safeguards in
+[Offline](#offline). Reopening is not an undo of a series rollover.
+
+**Legacy backend only:** the v2 web-client flow uses two writes: it adds a
+*new* task holding the finished occurrence, and updates the live series back
+to not-done with its dates moved
 on. A generic v2 update sending only `status = 2` therefore does not complete
 an occurrence — it ends the series, and every future repetition with it.
 
-So completing a recurring task here sends that same pair in one `batch/task`
-call. The finished occurrence is a copy with a fresh id, its recurrence
+So completing a recurring task on the legacy backend sends that pair in one
+`batch/task` call. The finished occurrence is a copy with a fresh id, its recurrence
 fields cleared and `repeatTaskId` pointing back at the series. The series
 keeps its id, stays open, and its start and due dates move by whole days in
 the task's own timezone — so a 9am task is still at 9am after the clocks
@@ -689,21 +752,29 @@ upload is worse than a completed copy without them.
 
 ## Focus timer
 
-TickTick's pomodoro is client-side. There is no server-side running clock to
-join, so this plugin runs its own and uploads each completed block through
-`POST /batch/pomodoro` — the same thing TickTick's apps do. Your durations,
-break lengths, long-break interval, and daily goal are read from the account
-(`/user/preferences/pomodoro`), so the rhythm matches the phone app.
+The plugin runs its own local timer; it does not join a clock running in another
+TickTick app. Finished blocks upload through official `POST /focus` or legacy
+`POST /batch/pomodoro`, according to the stored connection. Endpoint rejection
+does not trigger a private-API fallback. An uncertain official upload is saved
+for review, not automatically retried; the local timer remains available.
 
-Durations are settable per widget. Each of `pomoMinutes`,
-`shortBreakMinutes`, `longBreakMinutes`, and `longBreakInterval` defaults to
-`0`, meaning "use whatever TickTick says" — so the panel tracks your account
-until you deliberately disagree with it, and only the fields you set are
-overridden:
+The official API does not expose focus preferences. Its timer uses plugin
+defaults unless you set `pomoMinutes`, `shortBreakMinutes`, `longBreakMinutes`
+or `longBreakInterval`. For legacy sessions, `0` instead follows account
+preferences from `/user/preferences/pomodoro`; non-zero overrides work on both
+backends:
 
 ```json
 { "id": "io.github.sotoaugusto.ticktick", "pomoMinutes": 25, "longBreakInterval": 3 }
 ```
+
+Official statistics are derived from returned records with an `endTime` in
+today's account-timezone query: the count includes pomodoros, while duration
+sums ended pomodoro and stopwatch records using the server's duration in seconds.
+This is not an account-wide statistics or daily-goal endpoint, and the plugin
+does not interpret undocumented focus status codes. If the focus query fails
+without an authentication rejection, cached statistics are retained with a
+warning; authentication failures require reconnection.
 
 While a block runs the bar shows the countdown instead of the task count.
 Stopping a block early does **not** log it: TickTick counts a pomodoro on
@@ -719,9 +790,9 @@ meant to keep honest.
 
 MIT — see [LICENSE](LICENSE).
 
-Built on Omarchy and Quickshell, and it speaks TickTick's private v2 API,
-which several other projects mapped out first. Who contributed what, and what
-this plugin owes them, is in
+Built on Omarchy and Quickshell, using TickTick's official Open API for new
+connections and retaining a private v2 backend that other projects mapped out
+first. Who contributed what, and what this plugin owes them, is in
 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).
 
 Unofficial and unaffiliated: not endorsed by or supported by TickTick
@@ -729,8 +800,16 @@ Unofficial and unaffiliated: not endorsed by or supported by TickTick
 
 ## Limitations
 
-- Read plus the core writes. No editing titles, no rescheduling, no
-  subtasks, no moving between projects — do those in TickTick.
+- Core task writes include title/date edits and checklist toggles; moving
+  tasks between projects and broader task management stay in TickTick.
+- Official account-wide filtering is capped at 200 returned tasks, so inbox
+  coverage may be incomplete; reaching that cap produces a warning. Per-project
+  reads supplement the filter. Completed-task lookup is also bounded to up to
+  200 returned completions, not a full history search.
+- Official habit streaks use the check-in history fetched by the plugin
+  (currently a 60-day lookback), not a lifetime streak endpoint.
+- Capability availability may vary (including 403/404 responses). No automatic
+  private-API fallback, automatic renewal, or exhaustive recurrence guarantee.
 - Habit check-ins are all-or-step. Arbitrary values need `--value`.
 - One account.
 - Due notifications need a task to carry a time. A task dated today with no

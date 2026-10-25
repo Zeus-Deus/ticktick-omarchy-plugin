@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -30,6 +31,14 @@ Panel {
     if (root.bar) root.bar.run("if command -v ticktick >/dev/null 2>&1; then ticktick; else xdg-open https://ticktick.com/webapp; fi")
   }
 
+  // The popup is a layer-shell surface holding the keyboard. Anything that
+  // puts another window in front goes out after it is down, or the window
+  // opens behind a panel that still owns every key.
+  function launchTickTick() {
+    root.close()
+    Qt.callLater(root.openTickTick)
+  }
+
   // ---- the shared service ------------------------------------------------
   //
   // A bar exists per monitor, so this panel exists per monitor too. The cache,
@@ -45,6 +54,11 @@ Panel {
   // inline entry, so whichever loads first hands them over.
   onSvcChanged: pushSettings()
   onSettingsChanged: pushSettings()
+  Connections {
+    target: root.svc
+    ignoreUnknownSignals: true
+    function onLaunching() { if (root.opened) root.close() }
+  }
   function pushSettings() {
     if (svc && "settings" in svc) svc.settings = root.settings
   }
@@ -56,6 +70,28 @@ Panel {
 
   readonly property bool signedIn: cache.syncedAt > 0 && !cache.authRequired
   readonly property string cacheError: cache.error ? String(cache.error) : ""
+  readonly property string cacheWarning: cache.warnings && cache.warnings.length > 0 ? cache.warnings.join(" ") : ""
+  readonly property string defaultProject: String(setting("defaultProject", ""))
+  readonly property bool hasDefaultProject: (cache.projects || []).some(function(project) { return String(project.id) === root.defaultProject && !project.closed })
+  readonly property bool needsProjectChoice: cache.backend === "openapi" && !hasDefaultProject
+  readonly property var projectOptions: [{ value: "", label: "Choose a quick add list…" }].concat(
+    (cache.projects || []).filter(function(project) { return project.id && !project.closed }).map(function(project) {
+      return { value: String(project.id), label: String(project.name || "Untitled list") }
+    }))
+
+  function chooseProject(value) {
+    var valid = (root.cache.projects || []).some(function(project) {
+      return String(project.id) === value && !project.closed
+    })
+    if (!value || !valid) return
+    var entry = { id: root.moduleName }
+    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
+    entry.defaultProject = value
+    root.settings = entry
+    if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
   // Writes made while TickTick was unreachable, waiting on the next sync.
   readonly property int queuedCount: cache.queued || 0
 
@@ -93,6 +129,32 @@ Panel {
   readonly property int undoSeconds: svc ? svc.undoSeconds : 6
   readonly property string actionError: svc ? svc.actionError : ""
   readonly property bool connecting: svc ? svc.connecting : false
+
+  // Browser sign-in, run and owned by the service so it outlives this
+  // popup: the popup has to be down for the browser to be usable at all.
+  readonly property string authState: svc && svc.authState ? String(svc.authState) : "idle"
+  readonly property string authError: svc && svc.authError ? String(svc.authError) : ""
+  readonly property string authUrl: svc && svc.authUrl ? String(svc.authUrl) : ""
+  // The service reports a manual token check as "validating" too; that one
+  // is `connecting`, and belongs to the token section rather than the browser.
+  readonly property bool oauthActive: (svc ? svc.oauthConnecting === true : false)
+    || authState === "preparing" || authState === "waiting"
+    || (authState === "validating" && !connecting)
+  readonly property bool canStartOAuth: !!svc && typeof svc.startOAuth === "function"
+    && !oauthActive && !connecting
+
+  // A rejected credential is only a reconnect if there was a sync before it.
+  // The error cache keeps the last good payload, so syncedAt survives the
+  // rejection; a first run never has one.
+  readonly property bool reconnecting: cache.syncedAt > 0 && cache.authRequired
+
+  // Which card the setup surface shows. A held manual token is not a stage
+  // of its own: it lives in the token section that started it.
+  readonly property string setupStage: oauthActive ? "signing-in"
+    : authState === "failed" && !tokenAttempted ? "failed"
+    : reconnecting ? "reconnect"
+    : "connect"
+
   readonly property int refreshIntervalSec: svc ? svc.refreshIntervalSec : 300
 
   readonly property var pomoStats: svc ? svc.pomoStats : ({})
@@ -104,7 +166,9 @@ Panel {
 
   readonly property bool syncing: svc ? svc.syncing === true : false
 
-  function refresh(force) { if (svc) svc.refresh(force) }
+  // Not while signing in: a sync that starts before the new session lands
+  // stamps "signed out" over the cache the sign-in has just written.
+  function refresh(force) { if (svc && !oauthActive) svc.refresh(force) }
   function runAction(args) { if (svc) svc.runAction(args) }
   function completeTask(task) { if (svc) svc.completeTask(task) }
   function checkInHabit(habit) { if (svc) svc.checkInHabit(habit) }
@@ -116,10 +180,71 @@ Panel {
   function stopPomo() { if (svc) svc.stopPomo() }
   function togglePomo() { if (svc) svc.togglePomo() }
 
-  function connectWithToken() {
-    if (!svc) return
-    svc.connectWithToken(tokenPaste.text)
-    tokenPaste.text = ""
+  // ---- setup actions
+  //
+  // Sign-in and reopening the page hand off to the browser, so both close
+  // the popup first and only then ask the service, on the next turn of the
+  // event loop. Reopening the bar shows where it got to.
+  function connectTickTick() {
+    if (!canStartOAuth) return
+    tokenField.text = ""
+    tokenFallbackOpen = false
+    tokenAttempted = false
+    root.close()
+    Qt.callLater(function() { if (root.svc) root.svc.startOAuth() })
+  }
+
+  function reopenSignIn() {
+    if (!svc || typeof svc.reopenAuthPage !== "function" || authUrl === "") return
+    root.close()
+    Qt.callLater(function() { if (root.svc) root.svc.reopenAuthPage() })
+  }
+
+  // Cancel stays in the panel: nothing opens, and the card it returns to is
+  // the one you want next.
+  function cancelSignIn() {
+    if (svc && typeof svc.cancelOAuth === "function") svc.cancelOAuth()
+  }
+
+  // The fallback is folded away by default: a token is a long-lived
+  // credential, and the browser path never puts one on the clipboard.
+  property bool tokenFallbackOpen: false
+  // Set once a token has been sent, so a failure is reported where it was
+  // typed instead of a first-run "not signed in" turning up as an error.
+  property bool tokenAttempted: false
+  // A token failure is a failed auth to the service; here it is the token's.
+  readonly property string tokenError: tokenAttempted && !connecting && !signedIn
+    ? (authState === "failed" && authError !== "" ? authError : actionError) : ""
+
+  function toggleTokenFallback() {
+    tokenFallbackOpen = !tokenFallbackOpen
+    tokenField.text = ""
+    if (tokenFallbackOpen) tokenField.forceActiveFocus()
+    else keyCatcher.forceActiveFocus()
+  }
+
+  function connectWithApiToken() {
+    var token = String(tokenField.text || "").trim()
+    // The field is emptied before anything else, whatever happens next.
+    tokenField.text = ""
+    if (token === "" || connecting || oauthActive) return
+    if (!svc || typeof svc.connectWithApiToken !== "function") return
+    tokenAttempted = true
+    svc.connectWithApiToken(token)
+    keyCatcher.forceActiveFocus()
+  }
+
+  function leaveTokenField() {
+    tokenField.text = ""
+    keyCatcher.forceActiveFocus()
+  }
+
+  // The card disappears on its own; the receipt says why.
+  onSignedInChanged: {
+    if (!signedIn) return
+    tokenAttempted = false
+    tokenFallbackOpen = false
+    if (root.opened) showCopyNote("Connected to TickTick")
   }
 
   // Editing reuses the add field rather than introducing an editor. The row
@@ -418,6 +543,9 @@ Panel {
   // back out. Driven by expandedTaskId, so exactly one task is ever open.
   readonly property var navRows: {
     var rows = []
+    // Signed out, the last cache is still loaded but none of it is shown.
+    // A cursor over it would complete a task you cannot see.
+    if (!signedIn) return rows
     if (showTasks) {
       for (var i = 0; i < displayTasks.length; i++) {
         rows.push({ section: "task", index: i })
@@ -471,6 +599,11 @@ Panel {
   }
 
   function activateCursor() {
+    // The setup card has one primary action, so enter is that action.
+    if (!signedIn) {
+      if (setupStage === "connect" || setupStage === "reconnect" || setupStage === "failed") connectTickTick()
+      return
+    }
     if (cursor < 0 || cursor >= navRows.length) return
     var row = navRows[cursor]
     // completeTask ignores an id-less ghost, so a pending row is inert
@@ -528,6 +661,7 @@ Panel {
     // Closing is not a cancel. Anything still held is sent, so a click
     // followed by a close does what the click said it would.
     flushPending()
+    if (projectPicker.popupOpen) projectPicker.close()
     viewHorizon = horizon
     // A stale cursor is worse than none: reopening and pressing enter would
     // act on whatever was selected in a previous session, which is not the
@@ -541,6 +675,13 @@ Panel {
     quickAdd.text = ""
     quickAdd.text = ""
     quickAdd.focus = false
+    // A pasted credential never outlives the popup it was pasted into. A
+    // token already sent stays unfolded, so its result is there on reopen;
+    // a settled token failure keeps its claim on the error, so it never
+    // reappears as a browser sign-in that "didn't finish".
+    tokenField.text = ""
+    tokenField.focus = false
+    if (!connecting) tokenFallbackOpen = false
     root.controller.hide()
   }
 
@@ -562,7 +703,7 @@ Panel {
 
   // ---- surface ----------------------------------------------------------
 
-  readonly property color fg: Color.popups.text
+  readonly property color fg: Commons.Color.popups.text
   readonly property color muted: Qt.darker(fg, 1.5)
 
   KeyboardPanel {
@@ -578,7 +719,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: quickAdd.activeFocus
+      blocked: quickAdd.activeFocus || tokenField.activeFocus || projectPicker.popupOpen
       // Escape backs out one layer at a time — help, then a held action,
       // then the panel itself.
       onCloseRequested: {
@@ -600,7 +741,13 @@ Panel {
       onTextKey: function(text) {
         if (text === "?") root.helpVisible = !root.helpVisible
         else if (text === "r") root.refresh()
-        else if (text === "a") quickAdd.forceActiveFocus()
+        // The rest act on the list, the field and the timer, none of which
+        // exist until there is an account behind them.
+        else if (!root.signedIn) return
+        else if (text === "a") {
+          if (root.needsProjectChoice) projectPicker.open()
+          else quickAdd.forceActiveFocus()
+        }
         else if (text === "e") root.beginEdit()
         else if (text === "o") root.toggleDetails()
         else if (text === "c") root.copyCursorTask()
@@ -658,12 +805,15 @@ Panel {
                   id: viewRow
                   spacing: Style.space(5)
 
+                  // Signed out, an empty list is not news: "All clear" over a
+                  // setup card reads as "you have nothing to do".
                   Text {
                     id: viewLabel
-                    text: root.visibleTasks.length === 0 && root.habitsRemaining === 0
+                    text: !root.signedIn ? "TickTick"
+                      : root.visibleTasks.length === 0 && root.habitsRemaining === 0
                       ? "All clear"
                       : root.viewHorizon
-                    color: viewSwitch.containsMouse ? Color.accent : root.fg
+                    color: viewSwitch.containsMouse ? Commons.Color.accent : root.fg
                     font.family: Style.font.family
                     font.pixelSize: Style.font.title
                     font.bold: true
@@ -674,8 +824,10 @@ Panel {
                   // there are and which one is showing, which the chevron
                   // never did.
                   Row {
+                    id: viewDots
                     anchors.verticalCenter: viewLabel.verticalCenter
                     spacing: Style.space(3)
+                    visible: root.signedIn
 
                     Repeater {
                       model: Model.horizons()
@@ -686,7 +838,7 @@ Panel {
 
                         text: current ? "●" : "○"
                         color: current
-                          ? (viewSwitch.containsMouse ? Color.accent : root.fg)
+                          ? (viewSwitch.containsMouse ? Commons.Color.accent : root.fg)
                           : root.muted
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
@@ -698,6 +850,7 @@ Panel {
                 MouseArea {
                   id: viewSwitch
                   anchors.fill: parent
+                  enabled: root.signedIn
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
                   onClicked: root.cycleView(1)
@@ -720,12 +873,15 @@ Panel {
             // Offline work should be visible without opening anything. It
             // sits next to the sync button because that is what clears it.
             Text {
+              id: queuedBadge
               anchors.right: helpButton.left
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
-              visible: root.queuedCount > 0
+              // Signed out, the setup card says what is waiting and what
+              // clears it; a sync from here would only fail again.
+              visible: root.signedIn && root.queuedCount > 0
               text: " " + root.queuedCount
-              color: Color.accent
+              color: Commons.Color.accent
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
 
@@ -745,12 +901,12 @@ Panel {
 
             PanelActionButton {
               id: helpButton
-              anchors.right: syncButton.left
+              anchors.right: syncButton.visible ? syncButton.left : parent.right
               anchors.rightMargin: Style.space(2)
               anchors.verticalCenter: parent.verticalCenter
               iconText: ""
               tooltipText: "Keyboard shortcuts  (?)"
-              foreground: root.helpVisible ? Color.accent : root.muted
+              foreground: root.helpVisible ? Commons.Color.accent : root.muted
               onClicked: root.helpVisible = !root.helpVisible
             }
 
@@ -758,6 +914,7 @@ Panel {
               id: syncButton
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
+              visible: root.signedIn
               iconText: root.syncing ? "" : ""
               tooltipText: root.syncing ? "Syncing…" : "Sync now"
               foreground: root.fg
@@ -819,13 +976,13 @@ Panel {
                         implicitWidth: keyText.implicitWidth + Style.space(6)
                         height: keyText.implicitHeight + Style.space(2)
                         radius: Style.space(3)
-                        color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.13)
+                        color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.13)
 
                         Text {
                           id: keyText
                           anchors.centerIn: parent
                           text: shortcutRow.modelData.key
-                          color: Color.accent
+                          color: Commons.Color.accent
                           font.family: Style.font.family
                           font.pixelSize: Style.font.caption
                           font.bold: true
@@ -852,7 +1009,7 @@ Panel {
             height: root.pendingAction ? Style.space(28) : 0
             visible: root.pendingAction !== null
             radius: Style.space(4)
-            color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.14)
+            color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.14)
 
             Row {
               anchors.fill: parent
@@ -863,7 +1020,7 @@ Panel {
               Text {
                 anchors.verticalCenter: parent.verticalCenter
                 text: ""
-                color: Color.accent
+                color: Commons.Color.accent
                 font.family: Style.font.family
                 font.pixelSize: Style.font.icon
               }
@@ -898,7 +1055,7 @@ Panel {
                 id: undoCount
                 anchors.verticalCenter: parent.verticalCenter
                 text: "undo " + root.undoLeft + "s"
-                color: Color.accent
+                color: Commons.Color.accent
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
                 font.bold: true
@@ -936,11 +1093,15 @@ Panel {
             }
           }
 
-          // ---- not signed in
           // ---- setup. This is the only onboarding surface the plugin gets:
           //      `omarchy plugin add` never runs plugin code or install
           //      hooks, so there is no post-install script to lean on.
+          //
+          //      One action, one sentence of why it is safe. Sign-in happens
+          //      on ticktick.com in the browser; the API token is folded
+          //      underneath for machines where that is not an option.
           Column {
+            id: setupCard
             width: parent.width
             spacing: Style.space(6)
             visible: !root.signedIn
@@ -948,77 +1109,189 @@ Panel {
             PanelSeparator { width: parent.width; foreground: root.fg }
 
             Text {
+              id: setupLeadText
               width: parent.width
               wrapMode: Text.WordWrap
-              text: root.cache.authRequired
-                ? "TickTick ended this session. Paste a fresh token to reconnect."
-                : "Connect your TickTick account. This takes one paste."
+              text: root.setupLead()
+              textFormat: Text.PlainText
               color: root.fg
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
             }
 
             Text {
+              id: setupDetailText
               width: parent.width
               wrapMode: Text.WordWrap
-              text: "1. Open ticktick.com and sign in\n"
-                + "2. F12 → Application → Cookies → https://ticktick.com\n"
-                + "3. Copy the value of the cookie named  t"
-              color: root.muted
+              visible: text !== ""
+              text: root.setupDetail()
+              textFormat: Text.PlainText
+              // A failure reads in the same colour the footer uses for one.
+              color: root.setupStage === "failed" ? Commons.Color.accent : root.muted
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
-              lineHeight: 1.35
             }
 
-            TextField {
-              id: tokenPaste
+            Button {
+              id: connectButton
               width: parent.width
-              // The token is equivalent to a password, so it is masked and
-              // never echoed back into the panel.
-              password: true
-              placeholderText: "Paste the t cookie value…"
-              foreground: root.fg
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              enabled: !root.connecting
-              onAccepted: root.connectWithToken()
+              visible: root.setupStage !== "signing-in"
+              enabled: root.canStartOAuth
+              bordered: true
+              text: root.connectLabel()
+              foreground: Commons.Color.accent
+              fontSize: Style.font.bodySmall
+              onClicked: root.connectTickTick()
             }
 
+            // While the browser has it: a way back to the page if its tab got
+            // lost, and a way out that frees the callback listener.
             Row {
-              width: parent.width
+              id: signInControls
+              visible: root.setupStage === "signing-in"
               spacing: Style.space(6)
 
               Button {
-                text: root.connecting ? "Connecting…" : "Connect"
-                enabled: !root.connecting && String(tokenPaste.text || "").trim() !== ""
-                onClicked: root.connectWithToken()
+                id: reopenButton
+                visible: root.authState === "waiting" && root.authUrl !== ""
+                text: "Open sign-in page again"
+                foreground: root.fg
+                fontSize: Style.font.bodySmall
+                onClicked: root.reopenSignIn()
               }
 
               Button {
-                text: "Open TickTick"
-                onClicked: root.openTickTick()
+                id: cancelButton
+                text: "Cancel"
+                foreground: root.fg
+                fontSize: Style.font.bodySmall
+                onClicked: root.cancelSignIn()
               }
             }
 
-            Text {
+            Item {
+              id: tokenToggle
               width: parent.width
-              wrapMode: Text.WordWrap
-              visible: !root.cache.authRequired
-              text: " The token stays on this machine, in a 0600 file. Nothing reads your browser."
-              color: root.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
+              height: tokenToggleText.implicitHeight
+              visible: root.setupStage !== "signing-in"
+
+              Text {
+                id: tokenToggleText
+                text: "Use an API token instead " + (root.tokenFallbackOpen ? "▾" : "▸")
+                color: tokenToggleHover.containsMouse ? Commons.Color.accent : root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                id: tokenToggleHover
+                anchors.fill: tokenToggleText
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.toggleTokenFallback()
+              }
+            }
+
+            Column {
+              id: tokenFallback
+              width: parent.width
+              spacing: Style.space(6)
+              visible: root.tokenFallbackOpen && root.setupStage !== "signing-in"
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: "In TickTick, open Settings › Account › API Token, create a token and paste it here."
+                textFormat: Text.PlainText
+                color: root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              TextField {
+                id: tokenField
+                width: parent.width
+                // The token is equivalent to a password, so it is masked and
+                // never echoed back into the panel.
+                password: true
+                placeholderText: "Paste API token…"
+                foreground: root.fg
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                enabled: !root.connecting
+                onAccepted: root.connectWithApiToken()
+                Keys.onEscapePressed: root.leaveTokenField()
+              }
+
+              Button {
+                id: tokenConnectButton
+                bordered: true
+                text: root.connecting ? "Connecting…" : "Connect with token"
+                enabled: !root.connecting && String(tokenField.text || "").trim() !== ""
+                foreground: root.fg
+                fontSize: Style.font.bodySmall
+                onClicked: root.connectWithApiToken()
+              }
+
+              Text {
+                id: tokenErrorText
+                width: parent.width
+                wrapMode: Text.WordWrap
+                visible: root.tokenError !== ""
+                text: root.tokenError
+                textFormat: Text.PlainText
+                color: Commons.Color.accent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                id: tokenDisclosure
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: "Anyone holding this token can read and change your tasks. "
+                  + "It is kept only on this computer, in a private file. "
+                  + "Revoke it in TickTick if it leaks."
+                textFormat: Text.PlainText
+                color: root.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
             }
           }
 
-          // ---- quick add
+          // ---- quick add. The official API requires a real destination list.
+          Dropdown {
+            id: projectPicker
+            width: parent.width
+            visible: root.signedIn && root.showTasks && root.cache.backend === "openapi"
+            label: "Quick add list"
+            value: root.hasDefaultProject ? root.defaultProject : ""
+            options: root.projectOptions
+            foreground: root.fg
+            enabled: root.projectOptions.length > 1
+            onChanged: function(value) { root.chooseProject(value) }
+          }
+
+          Text {
+            width: parent.width
+            visible: projectPicker.visible && root.projectOptions.length <= 1
+            text: "Create a list in TickTick to use quick add here."
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: root.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
           TextField {
             id: quickAdd
             width: parent.width
             visible: root.signedIn && root.showTasks
+            enabled: root.editingTaskId !== "" || !root.needsProjectChoice
             placeholderText: root.editingTaskId !== ""
               ? "Editing — enter to save, esc to cancel"
-              : "Add a task…  #tag  !1  tomorrow"
+              : (root.needsProjectChoice ? "Choose a quick add list above…" : "Add a task…  #tag  !1  tomorrow")
             foreground: root.fg
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
@@ -1089,7 +1362,7 @@ Panel {
                   ? root.visibleTasks.length + " · " + root.overdueCount + " LATE"
                   : String(root.visibleTasks.length)
                 foreground: root.overdueCount > 0 && !root.backlogRuleVisible
-                  ? Color.accent : root.muted
+                  ? Commons.Color.accent : root.muted
               }
             }
 
@@ -1136,7 +1409,7 @@ Panel {
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
                     text: root.overdueCount + " LATE"
-                    foreground: Color.accent
+                    foreground: Commons.Color.accent
                   }
 
                   // The rule stops short of the count rather than running
@@ -1177,7 +1450,7 @@ Panel {
                   // states deserve two different marks, not two strengths of
                   // the same one.
                   border.width: taskRow.selected ? 1 : 0
-                  border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.55)
+                  border.color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.55)
 
                   // Row-wide hover for the highlight only. It deliberately
                   // accepts no buttons: completion is irreversible from here,
@@ -1224,7 +1497,7 @@ Panel {
                         anchors.centerIn: parent
                         opacity: taskRow.pending ? 0.45 : 1
                         text: circleHover.containsMouse ? "" : ""
-                        color: taskRow.late ? Color.accent : root.muted
+                        color: taskRow.late ? Commons.Color.accent : root.muted
                         font.family: Style.font.family
                         font.pixelSize: Style.font.icon
                       }
@@ -1328,7 +1601,7 @@ Panel {
                       anchors.verticalCenter: parent.verticalCenter
                       text: taskRow.pending ? "adding…" : Model.dueLabel(taskRow.modelData, root.nowDate)
                       color: taskRow.tier === "overdue"
-                        ? Color.accent
+                        ? Commons.Color.accent
                         : (taskRow.tier === "today" ? root.fg : root.muted)
                       font.family: Style.font.family
                       font.pixelSize: Style.font.caption
@@ -1456,7 +1729,7 @@ Panel {
                             Text {
                               anchors.centerIn: parent
                               text: subtaskRow.modelData.done ? "\u2611" : "\u2610"
-                              color: subtaskRow.modelData.done ? Color.accent : root.muted
+                              color: subtaskRow.modelData.done ? Commons.Color.accent : root.muted
                               font.family: Style.font.family
                               font.pixelSize: Style.font.bodySmall
                             }
@@ -1542,7 +1815,7 @@ Panel {
                   ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.08)
                   : "transparent"
                 border.width: habitRow.selected ? 1 : 0
-                border.color: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.55)
+                border.color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.55)
 
                 // Parity with tasks: the row highlights, the circle acts.
                 // Clicking a habit's name used to check it in, which is the
@@ -1572,7 +1845,7 @@ Panel {
                     Text {
                       anchors.centerIn: parent
                       text: habitRow.progress.done ? "" : ""
-                      color: habitRow.progress.done ? Color.accent : root.muted
+                      color: habitRow.progress.done ? Commons.Color.accent : root.muted
                       font.family: Style.font.family
                       font.pixelSize: Style.font.icon
                     }
@@ -1658,7 +1931,7 @@ Panel {
                 Text {
                   anchors.verticalCenter: parent.verticalCenter
                   text: ""
-                  color: root.pomoPhase === "focus" ? Color.accent : root.muted
+                  color: root.pomoPhase === "focus" ? Commons.Color.accent : root.muted
                   font.family: Style.font.family
                   font.pixelSize: Style.font.icon
                 }
@@ -1715,10 +1988,15 @@ Panel {
 
           // ---- out to the source of truth. A panel that only shows a
           //      slice of your tasks should say where the rest live.
+          //      Signed out it is still the way to the app, worded and
+          //      placed apart from the card so it never reads as a way to
+          //      connect: the app's own login does not reach this plugin.
+          //      Hidden mid sign-in, where the browser is the window to use.
           Item {
+            id: escapeRow
             width: parent.width
             height: Style.space(22)
-            visible: root.signedIn
+            visible: root.signedIn || root.setupStage !== "signing-in"
 
             Row {
               anchors.centerIn: parent
@@ -1726,8 +2004,8 @@ Panel {
 
               Text {
                 id: escapeLabel
-                text: "Open in TickTick"
-                color: escapeHover.containsMouse ? Color.accent : root.muted
+                text: root.signedIn ? "Open in TickTick" : "Open TickTick"
+                color: escapeHover.containsMouse ? Commons.Color.accent : root.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
               }
@@ -1735,7 +2013,7 @@ Panel {
               Text {
                 anchors.verticalCenter: escapeLabel.verticalCenter
                 text: ""
-                color: escapeHover.containsMouse ? Color.accent : root.muted
+                color: escapeHover.containsMouse ? Commons.Color.accent : root.muted
                 font.family: Style.font.family
                 font.pixelSize: Style.font.caption
               }
@@ -1746,25 +2024,28 @@ Panel {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: {
-                root.openTickTick()
-                root.close()
+              onClicked: root.launchTickTick()
+
+              PanelToolTip {
+                text: "Opens TickTick itself. Signing in there does not connect this panel."
+                visible: !root.signedIn && escapeHover.containsMouse
               }
             }
           }
 
           // ---- footer
           Text {
+            id: footerError
             width: parent.width
             // While the setup card is up it already explains the situation in
             // the plugin's own terms. Repeating the CLI's "run this command"
-            // underneath it contradicts the card, so the cached auth error is
-            // suppressed there. A failed connect attempt still surfaces.
-            visible: root.actionError !== "" || (root.cacheError !== "" && root.signedIn)
+            // underneath it contradicts the card, so nothing shows here then;
+            // sign-in and token failures are reported inside the card.
+            visible: root.signedIn && (root.actionError !== "" || root.cacheError !== "" || root.cacheWarning !== "")
             wrapMode: Text.WordWrap
-            text: root.actionError !== "" ? root.actionError : root.cacheError
+            text: root.actionError !== "" ? root.actionError : (root.cacheError !== "" ? root.cacheError : root.cacheWarning)
             textFormat: Text.PlainText
-            color: Color.accent
+            color: Commons.Color.accent
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
           }
@@ -1774,7 +2055,17 @@ Panel {
   }
 
   function headerSubtitle() {
-    if (!signedIn) return "Not connected"
+    if (!signedIn) {
+      if (setupStage === "signing-in") {
+        if (authState === "preparing") return "Starting sign-in…"
+        if (authState === "validating") return "Checking your account…"
+        return "Waiting for browser sign-in…"
+      }
+      if (connecting) return "Connecting…"
+      if (setupStage === "failed") return "Sign-in didn't finish"
+      if (setupStage === "reconnect") return "Signed out"
+      return "Not connected"
+    }
     if (root.syncing) return "Syncing…"
 
     var parts = []
@@ -1786,5 +2077,37 @@ Panel {
     var age = staleMinutes
     if (age > 10) parts.push("synced " + age + "m ago")
     return parts.join(" · ")
+  }
+
+  // ---- setup card copy. What it says follows setupStage; the service's
+  //      authError is already a sentence meant for people, never CLI output.
+
+  function setupLead() {
+    if (setupStage === "signing-in") {
+      if (authState === "preparing") return "Starting sign-in…"
+      if (authState === "validating") return "Checking your TickTick account…"
+      return "Finish signing in to TickTick in your browser."
+    }
+    if (setupStage === "failed") return "Sign-in didn't finish."
+    if (setupStage === "reconnect") {
+      var lead = "TickTick signed this plugin out. Reconnect to keep syncing."
+      if (queuedCount > 0)
+        lead += " " + queuedCount + (queuedCount === 1 ? " change is" : " changes are") + " waiting to send."
+      return lead
+    }
+    return "Connect your TickTick account to see your tasks, habits and focus here."
+  }
+
+  function setupDetail() {
+    if (setupStage === "signing-in")
+      return authState === "waiting" ? "This panel updates by itself once you allow access." : ""
+    if (setupStage === "failed") return authError !== "" ? authError : "TickTick didn't confirm the sign-in."
+    return "Sign-in opens ticktick.com in your browser. This plugin never sees your password."
+  }
+
+  function connectLabel() {
+    if (setupStage === "failed") return "Try again"
+    if (setupStage === "reconnect") return "Reconnect TickTick"
+    return "Connect TickTick"
   }
 }

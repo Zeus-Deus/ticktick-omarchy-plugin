@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TickTick v2 client for the Omarchy shell plugin.
+"""TickTick client for the Omarchy shell plugin.
 
 Why a CLI and not XMLHttpRequest inside QML: the session token is a
 long-lived credential that has to live in a 0600 file rather than in the
@@ -8,9 +8,8 @@ endpoint that answers 429 to anything eager, and the write paths are
 read-modify-write against the full task object. All three are miserable in
 QML and ordinary in Python. The shell only ever runs this and parses JSON.
 
-Endpoints are TickTick's *unofficial* v2 API — the same one the web app
-uses. The documented Open API v1 has no habits at all, which is why this
-plugin does not use it. It can break without notice.
+New OAuth and personal API token sessions use the official Open API.
+Explicit browser-cookie and password logins retain the legacy v2 backend.
 
 Commands:
   login [--email ADDR]          authenticate, store the session token
@@ -29,6 +28,8 @@ import argparse
 import contextlib
 import fcntl
 import getpass
+import hashlib
+import http.client
 import json
 import os
 import ssl
@@ -41,8 +42,13 @@ import urllib.request
 import zoneinfo
 from datetime import date, datetime, timedelta, timezone
 
+# Omarchy watches every installed plugin file. A local import must not create
+# __pycache__ and reload the service in the middle of browser authorization.
+sys.dont_write_bytecode = True
+
 DOMAIN = os.environ.get("TICKTICK_DOMAIN", "ticktick.com")
 API = f"https://api.{DOMAIN}/api/v2"
+OPEN_API = "https://api.ticktick.com/open/v1"
 
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
@@ -87,14 +93,19 @@ class TickTickError(RuntimeError):
         auth_required: bool = False,
         status: int | None = None,
         transient: bool = False,
+        needs_review: bool = False,
+        response_uncertain: bool = False,
     ):
         super().__init__(message)
         self.auth_required = auth_required
         self.status = status
-        # Transient means "the request never got a verdict" — the network was
-        # down, or TickTick asked us to slow down. Those are worth queueing.
-        # A rejection is not: replaying it just gets rejected again.
+        # Transient failures may be queued only when the operation is safe
+        # to replay. Official creates have no proven idempotency contract.
         self.transient = transient
+        self.needs_review = needs_review
+        # An unreadable official reply is not a provider rejection. Callers
+        # decide whether their operation is safe to replay.
+        self.response_uncertain = response_uncertain
 
 
 def is_series_head(task: dict) -> bool:
@@ -737,6 +748,15 @@ def _valid_token(token) -> bool:
 
 
 def _headers(session: dict, with_token: bool = True) -> dict:
+    if session.get("backend") == "openapi":
+        headers = {"Content-Type": "application/json", "Accept": "application/json",
+                   "User-Agent": "omarchy-ticktick"}
+        if with_token:
+            token = session.get("token")
+            if not _valid_token(token):
+                raise TickTickError("Stored TickTick access token is malformed; reconnect", auth_required=True)
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
     # Kept deliberately minimal. A fuller field set copied from TickTick's own
     # web bundle, and any Origin/Referer pair, both make the edge answer
     # access_forbidden — it blocks requests that claim to be the web app
@@ -786,12 +806,21 @@ def request(
     with_token: bool = True,
     timeout: int = 20,
 ) -> dict | list:
-    url = f"{API}{path}"
+    official = session.get("backend") == "openapi"
+    base = OPEN_API if official else API
+    url = f"{base}{path}"
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
 
     if urllib.parse.urlsplit(url).scheme != "https":
         raise TickTickError("Refusing to send TickTick credentials over non-HTTPS transport")
+    if official:
+        parsed_url = urllib.parse.urlsplit(url)
+        if (parsed_url.netloc != "api.ticktick.com" or not path.startswith("/")
+                or "?" in path or "#" in path or ".." in path.split("/")
+                or not parsed_url.path.startswith("/open/v1/")
+                or path.split("/")[1] not in ("preference", "project", "task", "tag", "habit", "focus")):
+            raise TickTickError("Refusing an unsafe TickTick Open API destination")
 
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method=method, headers=_headers(session, with_token))
@@ -805,8 +834,17 @@ def request(
             if len(raw_bytes) > MAX_BODY_BYTES:
                 raise TickTickError(
                     f"Response from {path} exceeded {MAX_BODY_BYTES // (1024 * 1024)} MB; "
-                    "refusing to buffer it"
+                    "refusing to buffer it", response_uncertain=official,
                 )
+            if official and response.headers.get("Content-Length") is not None:
+                length = response.headers["Content-Length"].strip()
+                # Bounded HTTPResponse.read(n) may silently return a short
+                # body, even syntactically valid JSON, without IncompleteRead.
+                # Compare decimal text without converting an untrusted integer.
+                if (not length.isascii() or not length.isdecimal()
+                        or (length.lstrip("0") or "0") != str(len(raw_bytes))):
+                    raise TickTickError("TickTick returned an incomplete response body",
+                                        response_uncertain=True)
             raw = raw_bytes.decode("utf-8").strip()
     except urllib.error.HTTPError as error:
         if 300 <= error.code < 400:
@@ -827,7 +865,7 @@ def request(
             parsed_error = json.loads(body)
         except ValueError:
             parsed_error = None
-        if isinstance(parsed_error, dict):
+        if not official and isinstance(parsed_error, dict):
             raise_for_payload(parsed_error, path)
 
         if error.code in (401, 403):
@@ -844,28 +882,46 @@ def request(
             ) from error
         if error.code == 404:
             raise TickTickError(
-                f"TickTick has no endpoint at {path} — the v2 API moved. "
-                "This plugin needs updating.",
+                ("TickTick could not find that Open API resource." if official else
+                 f"TickTick has no endpoint at {path} — the v2 API moved. This plugin needs updating."),
                 status=404,
             ) from error
-        raise TickTickError(f"HTTP {error.code} from {path}", status=error.code) from None
+        raise TickTickError(f"HTTP {error.code} from {path}", status=error.code,
+                            transient=official and error.code >= 500) from None
     except urllib.error.URLError as error:
         raise TickTickError(
-            f"Network error talking to TickTick: {error.reason}", transient=True
-        ) from error
+            "Network error talking to TickTick", transient=True
+        ) from None
     except TimeoutError as error:
         raise TickTickError("TickTick timed out", transient=True) from error
+    except (http.client.HTTPException, OSError):
+        if not official:
+            raise
+        # read() can fail after a committed POST (IncompleteRead, reset,
+        # aborted TLS, etc.). Never propagate partial bytes or peer text.
+        raise TickTickError("TickTick response was interrupted", transient=True,
+                            response_uncertain=True) from None
+    except UnicodeError:
+        raise TickTickError("TickTick returned an invalid response encoding",
+                            response_uncertain=official) from None
 
     if not raw:
         return {}
     try:
         parsed = json.loads(raw)
-    except ValueError as error:
+    except (ValueError, RecursionError) as error:
+        if official:
+            raise TickTickError("TickTick returned an invalid JSON response",
+                                response_uncertain=True) from None
+        if isinstance(error, RecursionError):
+            raise
         raise TickTickError(f"Malformed JSON from {path}") from error
 
     # v2 signals failures in-band with a 200 as often as with a status code.
     if isinstance(parsed, dict):
         raise_for_payload(parsed, path)
+        if official and (parsed.get("error") or parsed.get("id2error")):
+            raise TickTickError("TickTick rejected the Open API request")
 
     return parsed
 
@@ -911,6 +967,9 @@ def authed_session() -> dict:
             "Not signed in to TickTick. Run: omarchy-ticktick login",
             auth_required=True,
         )
+    if (session.get("backend") == "openapi" and session.get("expiresAt")
+            and session["expiresAt"] <= int(time.time() * 1000)):
+        raise TickTickError("TickTick authorization expired; reconnect", auth_required=True)
     return session
 
 
@@ -923,8 +982,43 @@ def with_session(call):
     could not happen. An expired session now surfaces as an auth error, which
     the panel already turns into "paste a fresh token".
     """
-    session = authed_session()
-    return call(session), session
+    with account_lock():
+        session = authed_session()
+        try:
+            return call(session), session
+        except TickTickError as error:
+            error.session = session
+            raise
+
+
+def session_owner(session: dict) -> str:
+    if not session.get("token"):
+        return ""
+    value = f"{session.get('backend', 'v2')}:{session['token']}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+@contextlib.contextmanager
+def account_lock():
+    # A separate lock from the outbox drain lets login coexist with sync
+    # without adopting another account while a mutation is in flight.
+    with _ensure_state_dir() as directory:
+        fd = os.open("session.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=directory)
+    with os.fdopen(fd, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def ensure_session_switch_safe(candidate: dict) -> None:
+    if read_outbox() and session_owner(candidate) != session_owner(load_session()):
+        raise TickTickError(
+            "Pending changes belong to the current TickTick connection. Sync them with that "
+            "connection before changing account, token, or backend; the cache and outbox were preserved."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -964,9 +1058,9 @@ def parse_api_time(value: str | None) -> datetime | None:
 # --------------------------------------------------------------------------
 # outbox
 #
-# Every write this plugin makes carries a client-generated id, so replaying a
-# queued write updates the same record rather than creating a second one.
-# That is what makes an outbox safe here.
+# Legacy writes carry client-generated ids. Official task/focus creates do
+# not preserve those ids, so unconfirmed creates are retained for review,
+# never replayed. Updates still target an existing record or check-in date.
 
 
 def read_outbox() -> list:
@@ -979,23 +1073,29 @@ def write_outbox(entries: list) -> None:
     _write_private(OUTBOX_PATH, {"version": 1, "entries": entries})
 
 
-def queue_write(kind: str, payload: dict, reason: str) -> dict:
-    """Park a write that never reached TickTick, and apply it locally now.
+def queue_write(kind: str, payload: dict, reason: str, session: dict | None = None) -> dict:
+    """Retain a pending write, applying only safe optimistic changes locally.
 
     Applying to the cache immediately is the point: the queued change stays
     visible across a shell restart instead of living only in the panel's
     memory, where a restart would lose it silently.
     """
-    entry = {
-        "id": object_id(),
-        "kind": kind,
-        "payload": payload,
-        "queuedAt": int(time.time() * 1000),
-        "attempts": 0,
-        "lastError": reason,
-    }
-    write_outbox(read_outbox() + [entry])
-    apply_locally(kind, payload)
+    with account_lock():
+        current = load_session()
+        if session is not None and session_owner(session) != session_owner(current):
+            raise TickTickError("TickTick connection changed before the write could be queued; retry the action")
+        entry = {
+            "id": object_id(),
+            "kind": kind,
+            "payload": payload,
+            "queuedAt": int(time.time() * 1000),
+            "attempts": 0,
+            "lastError": reason,
+            "owner": session_owner(current),
+            "backend": current.get("backend", "v2"),
+        }
+        write_outbox(read_outbox() + [entry])
+        apply_locally(kind, payload)
     return entry
 
 
@@ -1004,9 +1104,16 @@ def apply_locally(kind: str, payload: dict) -> None:
     cache = _read_json(DATA_PATH)
     if not cache:
         return
+    if payload.get("needsReview"):
+        cache["queued"] = len(read_outbox())
+        _write_private(DATA_PATH, cache)
+        return
 
     if kind == "add":
-        cache.setdefault("tasks", []).append(payload["task"])
+        if not payload.get("needsReview"):
+            tasks = cache.setdefault("tasks", [])
+            if not any(task.get("id") == payload["task"].get("id") for task in tasks):
+                tasks.append(payload["task"])
 
     elif kind in ("complete", "reopen"):
         target = STATUS_DONE if kind == "complete" else STATUS_TODO
@@ -1014,7 +1121,7 @@ def apply_locally(kind: str, payload: dict) -> None:
             if task.get("id") != payload["taskId"]:
                 continue
             plan = None
-            if target == STATUS_DONE and is_series_head(task):
+            if target == STATUS_DONE and is_series_head(task) and cache.get("backend") != "openapi":
                 # Mirror the transaction the replay will send, so the panel
                 # shows the next occurrence rather than a vanished task.
                 with contextlib.suppress(TickTickError):
@@ -1037,7 +1144,17 @@ def apply_locally(kind: str, payload: dict) -> None:
     elif kind == "subtask":
         for task in cache.get("tasks", []):
             if task.get("id") == payload["taskId"]:
-                flip_subtask(task, payload["itemId"])
+                if payload.get("item"):
+                    for item in task.get("items") or []:
+                        if item.get("id") == payload["itemId"]:
+                            item["status"] = payload["item"]["status"]
+                            if payload["item"].get("completedTime"):
+                                item["completedTime"] = payload["item"]["completedTime"]
+                            else:
+                                item.pop("completedTime", None)
+                            break
+                else:
+                    flip_subtask(task, payload["itemId"])
                 break
 
     elif kind == "checkin":
@@ -1052,10 +1169,11 @@ def apply_locally(kind: str, payload: dict) -> None:
             entries.append(entry)
 
     elif kind == "pomo":
-        stats = cache.setdefault("pomoStats", {})
-        minutes = payload.get("minutes", 0)
-        stats["todayPomoCount"] = int(stats.get("todayPomoCount", 0)) + 1
-        stats["todayPomoDuration"] = int(stats.get("todayPomoDuration", 0)) + int(minutes)
+        if not payload.get("needsReview"):
+            stats = cache.setdefault("pomoStats", {})
+            minutes = payload.get("minutes", 0)
+            stats["todayPomoCount"] = int(stats.get("todayPomoCount", 0)) + 1
+            stats["todayPomoDuration"] = int(stats.get("todayPomoDuration", 0)) + int(minutes)
 
     cache["queued"] = len(read_outbox())
     _write_private(DATA_PATH, cache)
@@ -1071,6 +1189,12 @@ def replay(entry: dict, session: dict) -> None:
     """
     kind = entry.get("kind")
     payload = entry.get("payload") or {}
+    if (entry.get("owner") and entry["owner"] != session_owner(session)) or (
+        entry.get("backend", "v2") != session.get("backend", "v2")
+    ):
+        raise TickTickError("Queued changes belong to a different TickTick connection; outbox preserved")
+    if session.get("backend") == "openapi":
+        return replay_openapi(kind, payload, session)
 
     if kind == "add":
         batch_task(session, add=[payload["task"]])
@@ -1168,6 +1292,10 @@ def drain_outbox(session: dict) -> dict:
     entries = read_outbox()
     if not entries:
         return {"sent": 0, "queued": 0, "dropped": 0}
+    for entry in entries:
+        if ((entry.get("owner") and entry["owner"] != session_owner(session))
+                or entry.get("backend", "v2") != session.get("backend", "v2")):
+            raise TickTickError("Queued changes belong to a different TickTick connection; outbox preserved")
 
     remaining, sent, dropped = [], 0, 0
     stalled = False
@@ -1182,7 +1310,7 @@ def drain_outbox(session: dict) -> dict:
         except TickTickError as error:
             entry["attempts"] = int(entry.get("attempts", 0)) + 1
             entry["lastError"] = str(error)
-            if error.transient:
+            if error.transient or error.auth_required or session.get("backend") == "openapi":
                 # Still offline. Keep the rest queued and preserve order
                 # rather than hammering a dead network once per entry.
                 remaining.append(entry)
@@ -1209,7 +1337,11 @@ def fetch_state(session: dict, scope: str = "full") -> dict:
     half spent confirming that nothing happened. Sections outside the scope
     are carried over from the cache untouched.
     """
+    if session.get("backend") == "openapi":
+        return fetch_openapi_state(session, scope)
     previous = _read_json(DATA_PATH)
+    if previous.get("cacheOwner") and previous["cacheOwner"] != session_owner(session):
+        previous = {}
     want_tasks = scope in ("full", "tasks")
     want_habits = scope in ("full", "habits")
     want_pomo = scope in ("full", "pomo")
@@ -1287,6 +1419,8 @@ def fetch_state(session: dict, scope: str = "full") -> dict:
         pass
 
     return {
+        "cacheOwner": session_owner(session),
+        "backend": "v2",
         "syncedAt": int(time.time() * 1000),
         "scope": scope,
         "inboxId": inbox_id,
@@ -1304,7 +1438,14 @@ def fetch_state(session: dict, scope: str = "full") -> dict:
 
 
 def write_cache(state: dict) -> None:
-    _write_private(DATA_PATH, state)
+    with account_lock():
+        if state.get("cacheOwner") and state["cacheOwner"] != session_owner(load_session()):
+            raise TickTickError("TickTick connection changed during sync; stale cache was not saved")
+        _write_private(DATA_PATH, state)
+        if state.get("backend") == "openapi":
+            for entry in read_outbox():
+                if entry.get("owner") == state.get("cacheOwner"):
+                    apply_locally(entry["kind"], entry.get("payload") or {})
 
 
 def write_error_cache(message: str, auth_required: bool) -> None:
@@ -1338,6 +1479,8 @@ def find_task(task_id: str, session: dict) -> dict:
     exactly what removes it — so a miss falls back to the completed list.
     Without this, undo is impossible for the action most in need of one.
     """
+    if session.get("backend") == "openapi":
+        return find_openapi_task(task_id, session)
     try:
         return cached_task(task_id)
     except TickTickError:
@@ -1360,6 +1503,293 @@ def resolve_habit(needle: str) -> dict:
         if str(habit.get("name", "")).strip().lower() == lowered:
             return habit
     raise TickTickError(f"No habit matching {needle!r} in the local cache")
+
+
+# --------------------------------------------------------------------------
+# official Open API adapters
+
+
+def _api_id(value) -> str:
+    if not isinstance(value, str) or not value or value in (".", ".."):
+        raise TickTickError("TickTick resource has no usable identifier; sync first")
+    return urllib.parse.quote(value, safe="")
+
+
+def _open_time(value: str) -> str:
+    stamp = parse_api_time(value)
+    if stamp is None or stamp.tzinfo is None:
+        raise TickTickError("TickTick date has no usable time zone")
+    return stamp.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _objects(value, resource: str) -> list:
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise TickTickError(f"Unexpected Open API {resource} response")
+    return value
+
+
+def normalize_openapi_checkins(rows) -> dict:
+    result = {}
+    for row in _objects(rows, "habit check-ins"):
+        habit_id = row.get("habitId")
+        if not habit_id:
+            raise TickTickError("Open API check-in response has no habit identifier")
+        entries = result.setdefault(habit_id, [])
+        for item in _objects(row.get("checkins"), "habit check-in entries"):
+            if "stamp" not in item:
+                raise TickTickError("Open API check-in response has no date stamp")
+            normalized = dict(item, habitId=habit_id, checkinStamp=item["stamp"])
+            if "time" in item:
+                normalized["checkinTime"] = item["time"]
+            # These are cache/UI status constants, not provider status codes.
+            # The official contract does not enumerate check-in status values.
+            normalized["providerStatus"] = item.get("status")
+            goal = normalized.setdefault("goal", 1.0)
+            value = normalized.setdefault("value", 1.0)
+            normalized["status"] = CHECKIN_DONE if value >= goal else CHECKIN_UNCHECKED
+            entries.append(normalized)
+    return result
+
+
+def fetch_openapi_state(session: dict, scope: str = "full") -> dict:
+    previous = _read_json(DATA_PATH)
+    if previous.get("cacheOwner") != session_owner(session):
+        previous = {}
+    prefs = request("POST", "/preference", session)
+    if not isinstance(prefs, dict) or not isinstance(prefs.get("timeZone"), str):
+        raise TickTickError("Unexpected Open API preferences response")
+    warnings = []
+    tasks = previous.get("tasks", [])
+    projects = previous.get("projects", [])
+    tags = previous.get("tags", [])
+    if scope in ("full", "tasks"):
+        raw_projects = _objects(request("GET", "/project", session), "projects")
+        projects = [{key: p[key] for key in ("id", "name", "color", "closed") if key in p}
+                    for p in raw_projects]
+        by_id = {}
+        for project in raw_projects:
+            data = request("GET", f"/project/{_api_id(project.get('id'))}/data", session)
+            if not isinstance(data, dict):
+                raise TickTickError("Unexpected Open API project data response")
+            for task in _objects(data.get("tasks"), "project tasks"):
+                by_id[task["id"]] = task
+        # No inbox id is exposed by the documented preferences/project DTOs.
+        # The account-wide filter includes tasks outside the listed projects,
+        # but is capped at 200 by the provider and has no pagination contract.
+        filtered = _objects(request("POST", "/task/filter", session, payload={"status": [0]}), "tasks")
+        for task in filtered:
+            by_id[task["id"]] = task
+        if len(filtered) >= 200:
+            warnings.append("The account-wide task filter reached its 200-task limit; inbox coverage may be incomplete.")
+        tasks = list(by_id.values())
+        tags = _objects(request("GET", "/tag", session), "tags")
+    habits = previous.get("habits", [])
+    checkins = previous.get("checkins", {})
+    if scope in ("full", "habits"):
+        habits = _objects(request("GET", "/habit", session), "habits")
+        habits = [habit for habit in habits if not habit.get("archivedTime")]
+        habit_ids = [habit["id"] for habit in habits if habit.get("id")]
+        checkins = {}
+        if habit_ids:
+            rows = request("GET", "/habit/checkins", session, params={
+                "habitIds": ",".join(habit_ids),
+                "from": date_stamp(datetime.now() - timedelta(days=60)), "to": date_stamp(),
+            })
+            checkins = normalize_openapi_checkins(rows)
+    stats = previous.get("pomoStats", {})
+    if scope in ("full", "pomo"):
+        try:
+            zone = zoneinfo.ZoneInfo(prefs["timeZone"])
+        except (ValueError, zoneinfo.ZoneInfoNotFoundError):
+            raise TickTickError("TickTick returned an unknown account time zone") from None
+        now = datetime.now(zone)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        try:
+            ended = []
+            for focus_type in (0, 1):
+                records = _objects(request("GET", "/focus", session, params={
+                    "from": _open_time(to_api_time(start)), "to": _open_time(to_api_time(now)),
+                    "type": focus_type,
+                }), "focus")
+                ended.extend(record for record in records if record.get("endTime"))
+            # The official CLI specifies focus duration in seconds. Do not
+            # interpret undocumented focus status codes or subtract pauses
+            # again from a server-provided duration.
+            stats = {"todayPomoCount": sum(record.get("type") == 0 for record in ended),
+                     "todayPomoDuration": round(sum(record.get("duration", 0) for record in ended) / 60)}
+        except TickTickError as error:
+            if error.auth_required:
+                raise
+            warnings.append("Focus statistics could not be refreshed; the last cached values were retained.")
+    return {
+        "syncedAt": int(time.time() * 1000), "scope": scope,
+        "backend": "openapi", "authMethod": session.get("source", "api-token"),
+        "cacheOwner": session_owner(session), "timeZone": prefs["timeZone"],
+        "inboxId": "", "tasks": tasks, "projects": projects, "tags": tags,
+        "habits": habits, "checkins": checkins, "todayStamp": date_stamp(),
+        "pomoStats": stats, "pomoPrefs": previous.get("pomoPrefs", {}),
+        "capabilities": {"recurringCompletion": True, "focusPreferences": False,
+                         "inboxDiscovery": False, "focusStats": "ended-records"},
+        "warnings": warnings, "authRequired": False, "error": None,
+    }
+
+
+def find_openapi_task(task_id: str, session: dict) -> dict:
+    cache = _read_json(DATA_PATH)
+    if cache.get("cacheOwner") == session_owner(session):
+        for task in cache.get("tasks", []):
+            if task.get("id") == task_id:
+                result = request("GET", f"/project/{_api_id(task.get('projectId'))}/task/{_api_id(task_id)}", session)
+                if not isinstance(result, dict) or result.get("id") != task_id:
+                    raise TickTickError("Unexpected Open API task response")
+                return result
+    completed = _objects(request("POST", "/task/completed", session, payload={}), "completed tasks")
+    for task in completed:
+        if task.get("id") == task_id:
+            return task
+    raise TickTickError("Task is absent from this connection's cache and up to 200 returned completions; sync or use TickTick")
+
+
+OPEN_TASK_FIELDS = (
+    "id", "projectId", "parentId", "title", "content", "desc", "isAllDay", "startDate",
+    "dueDate", "timeZone", "reminders", "tags", "repeatFlag", "repeatFrom", "priority", "sortOrder", "items",
+)
+OPEN_ITEM_FIELDS = ("id", "title", "status", "completedTime", "isAllDay", "sortOrder", "startDate", "timeZone")
+
+
+def openapi_task_input(task: dict) -> dict:
+    body = {key: task[key] for key in OPEN_TASK_FIELDS if key in task}
+    for key in ("startDate", "dueDate"):
+        if body.get(key):
+            body[key] = _open_time(body[key])
+    if "items" in body:
+        body["items"] = [{key: item[key] for key in OPEN_ITEM_FIELDS if key in item}
+                         for item in body["items"]]
+        for item in body["items"]:
+            for key in ("startDate", "completedTime"):
+                if item.get(key):
+                    item[key] = _open_time(item[key])
+    return body
+
+
+def openapi_create(path: str, session: dict, body: dict):
+    """Send a non-idempotent create once; an uncertain result needs review."""
+    try:
+        return request("POST", path, session, payload=body)
+    except TickTickError as error:
+        if error.auth_required or (error.status is not None and 400 <= error.status < 500):
+            raise
+        if not (error.transient or error.response_uncertain or error.needs_review):
+            # A decoded provider rejection (including HTTP 200 error
+            # envelopes) is definitive, unlike an unreadable response.
+            raise
+        # A timeout, lost/malformed response, or server error can follow a
+        # committed write. Neither a local id nor a later sync proves which
+        # task/focus record it created, so do not turn this into a retry.
+        raise TickTickError(
+            "Open API creation could not be confirmed; needs review before retrying",
+            status=error.status, needs_review=True,
+        ) from None
+
+
+def openapi_create_task(session: dict, task: dict) -> dict:
+    body = openapi_task_input(task)
+    body.pop("id", None)
+    result = openapi_create("/task", session, body)
+    if (not isinstance(result, dict) or not isinstance(result.get("id"), str)
+            or not result["id"].strip() or result["id"] in (".", "..")):
+        raise TickTickError(
+            "Open API task creation returned no usable task ID; needs review before retrying",
+            needs_review=True,
+        )
+    return dict(task, **result)
+
+
+def openapi_status(session: dict, task: dict, status: int) -> dict:
+    # The official endpoint rolls the live series forward server-side. This
+    # was verified on isolated daily series for both official repeatFrom modes.
+    # Never apply v2's differently numbered, client-side recurrence arithmetic.
+    recurring = bool(task.get("repeatFlag") or task.get("repeatFrom") not in (None, "", 0, "0"))
+    if recurring and status == STATUS_DONE:
+        try:
+            parse_repeat_rule(task.get("repeatFlag"))
+        except UnsupportedRecurrence:
+            raise TickTickError("This repeat rule is not supported here; use TickTick for this task") from None
+    task_id = _api_id(task.get("id"))
+    project_id = _api_id(task.get("projectId"))
+    if status == STATUS_DONE:
+        try:
+            request("POST", f"/project/{project_id}/task/{task_id}/complete", session)
+        except TickTickError as error:
+            if recurring and (error.transient or error.response_uncertain or error.needs_review):
+                raise TickTickError("Recurring completion could not be confirmed; retain it for review before retrying",
+                                    needs_review=True) from None
+            raise
+    elif status == STATUS_TODO:
+        request("POST", f"/task/{task_id}", session,
+                payload={"id": task["id"], "projectId": task["projectId"], "status": 0})
+    else:
+        raise TickTickError("Unsupported Open API task status")
+    return dict(task, status=status)
+
+
+def openapi_checkin_body(entry: dict) -> dict:
+    return {"stamp": entry["checkinStamp"], "time": _open_time(entry["checkinTime"]),
+            "opTime": _open_time(entry["opTime"]), "value": entry["value"], "goal": entry["goal"]}
+
+
+def replay_openapi(kind: str, payload: dict, session: dict) -> None:
+    if payload.get("needsReview"):
+        raise TickTickError("This official API write needs review before retrying", needs_review=True)
+    if kind in ("complete", "reopen"):
+        task = find_task(payload["taskId"], session)
+        if "expectedDueDate" in payload:
+            actual, expected = task.get("dueDate"), payload["expectedDueDate"]
+            if task.get("isAllDay"):
+                actual, expected = str(actual or "")[:10], str(expected or "")[:10]
+            elif parse_api_time(actual) is not None and parse_api_time(expected) is not None:
+                actual, expected = parse_api_time(actual), parse_api_time(expected)
+            if actual != expected:
+                payload["needsReview"] = True
+                raise TickTickError("The recurring occurrence changed while offline; queued completion needs review",
+                                    needs_review=True)
+        try:
+            openapi_status(session, task, STATUS_DONE if kind == "complete" else STATUS_TODO)
+        except TickTickError as error:
+            if error.needs_review:
+                payload["needsReview"] = True
+            raise
+    elif kind == "add":
+        # This includes older entries whose client id was previously assumed
+        # to be preserved. We cannot prove whether they already created a task.
+        payload["needsReview"] = True
+        raise TickTickError("Open API task creation has no safe replay contract; task entry retained for review",
+                            needs_review=True)
+    elif kind == "update":
+        batch_task(session, update=[apply_edit(find_task(payload["taskId"], session), payload["fields"])])
+    elif kind == "subtask":
+        task = find_task(payload["taskId"], session)
+        if not payload.get("item"):
+            raise TickTickError("Queued Open API checkbox has no confirmed target state; entry retained for review")
+        for item in task.get("items") or []:
+            if item.get("id") == payload["itemId"]:
+                item["status"] = payload["item"]["status"]
+                if payload["item"].get("completedTime"):
+                    item["completedTime"] = payload["item"]["completedTime"]
+                else:
+                    item.pop("completedTime", None)
+                batch_task(session, update=[task])
+                break
+    elif kind == "checkin":
+        entry = payload["entry"]
+        request("POST", f"/habit/{_api_id(entry['habitId'])}/checkin", session,
+                payload=openapi_checkin_body(entry))
+    elif kind == "pomo":
+        # Official creates have server-generated IDs and no idempotency
+        # contract. Such records must not be blindly replayed after timeout.
+        raise TickTickError("Open API focus creation has no safe replay contract; focus entry retained for review")
+    else:
+        raise TickTickError("Unknown queued Open API action")
 
 
 # --------------------------------------------------------------------------
@@ -1386,6 +1816,19 @@ def log_pomodoro(start: datetime, end: datetime, pause_seconds: int, pomo_type: 
     }
 
     def call(session):
+        if session.get("backend") == "openapi":
+            if pomo_type not in (0, 1) or end < start:
+                raise TickTickError("Invalid Open API focus type or time range")
+            body = {"type": pomo_type, "startTime": _open_time(entry["startTime"]),
+                    "endTime": _open_time(entry["endTime"]), "pauseDuration": entry["pauseDuration"]}
+            result = openapi_create("/focus", session, body)
+            if isinstance(result, dict) and result.get("id"):
+                entry["id"] = result["id"]
+            else:
+                # A documented 201 may have no body; the local reference is
+                # not a provider id and must never be used to update focus.
+                entry["localOnlyId"] = True
+            return result
         return request(
             "POST",
             "/batch/pomodoro",
@@ -1396,12 +1839,22 @@ def log_pomodoro(start: datetime, end: datetime, pause_seconds: int, pomo_type: 
     try:
         result, _ = with_session(call)
     except TickTickError as error:
+        session = getattr(error, "session", None)
+        if (session and session.get("backend") == "openapi"
+                and (error.transient or error.needs_review)):
+            queue_write("pomo", {"entry": entry, "needsReview": True}, str(error), session)
+            raise TickTickError(
+                "Focus upload could not be confirmed. The session was saved in the outbox for review; "
+                "automatic retry could duplicate it. Your local timer remains available.",
+                needs_review=True,
+            ) from None
         if not error.transient:
             raise
         queue_write(
             "pomo",
             {"entry": entry, "minutes": round((end - start).total_seconds() / 60)},
             str(error),
+            session,
         )
         entry["queued"] = True
         return entry
@@ -1412,6 +1865,30 @@ def log_pomodoro(start: datetime, end: datetime, pause_seconds: int, pomo_type: 
 
 
 def batch_task(session: dict, add=None, update=None, delete=None) -> dict:
+    """Official adds return actual singleton Tasks in `created`; not an ID map.
+
+    Official batches are sequential and may partially succeed. On failure,
+    `error.created_tasks` retains confirmed creations; the batch is not safe
+    to retry as a unit. Legacy batch requests and responses are unchanged.
+    """
+    if session.get("backend") == "openapi":
+        if delete:
+            raise TickTickError("Open API deletions require the task's project")
+        created, updated, result = [], [], {}
+        try:
+            for task in add or []:
+                created.append(openapi_create_task(session, task))
+            for task in update or []:
+                result = request("POST", f"/task/{_api_id(task.get('id'))}", session,
+                                 payload=openapi_task_input(task))
+                updated.append(result)
+        except TickTickError as error:
+            error.created_tasks = created
+            if created:
+                error.transient = False
+                error.needs_review = True
+            raise
+        return {"created": created, "updated": updated} if add else (result if isinstance(result, dict) else {})
     payload = {"add": add or [], "update": update or [], "delete": delete or []}
     result = request("POST", "/batch/task", session, payload=payload)
     return result if isinstance(result, dict) else {}
@@ -1425,17 +1902,26 @@ def set_task_status(task_id: str, status: int) -> dict:
     only status/completedTime move.
     """
     holder = {}
+    local_task = None
 
     if status == STATUS_DONE:
         try:
             local_task = cached_task(task_id)
         except TickTickError:
             local_task = None
-        if local_task is not None:
-            ensure_completion_is_safe(local_task, status)
+        if local_task is not None and is_series_head(local_task):
+            # Rule-format validation is shared. Backend-specific date math
+            # belongs to the dispatched session, never an ambient credential read.
+            try:
+                parse_repeat_rule(local_task.get("repeatFlag"))
+            except UnsupportedRecurrence as reason:
+                raise TickTickError(RECURRENCE_REFUSAL.format(reason=reason)) from None
 
     def call(session):
         task = dict(find_task(task_id, session))
+        if session.get("backend") == "openapi":
+            holder["task"] = openapi_status(session, task, status)
+            return holder["task"]
         if status == STATUS_DONE and is_series_head(task):
             plan = recurring_completion_plan(task, now_api_time())
             if plan is not None:
@@ -1454,13 +1940,22 @@ def set_task_status(task_id: str, status: int) -> dict:
     try:
         with_session(call)
     except TickTickError as error:
-        if not error.transient:
+        if not error.transient and not error.needs_review:
             raise
-        queue_write(
-            "complete" if status == STATUS_DONE else "reopen",
-            {"taskId": task_id, "completedTime": now_api_time()},
-            str(error),
-        )
+        session = getattr(error, "session", None)
+        if local_task is not None and (not session or session.get("backend") != "openapi"):
+            ensure_completion_is_safe(local_task, status)
+        payload = {"taskId": task_id, "completedTime": now_api_time()}
+        if session and session.get("backend") == "openapi":
+            local = cached_task(task_id)
+            if local.get("repeatFlag") or local.get("repeatFrom") not in (None, "", 0, "0"):
+                payload["expectedDueDate"] = local.get("dueDate")
+            if error.needs_review:
+                payload["needsReview"] = True
+        queue_write("complete" if status == STATUS_DONE else "reopen", payload, str(error), session)
+        if error.needs_review:
+            raise TickTickError("Recurring completion was saved for review; check TickTick before retrying so the next occurrence is not skipped",
+                                needs_review=True) from None
         holder["task"] = {"id": task_id, "queued": True}
     return holder["task"]
 
@@ -1501,7 +1996,7 @@ def update_task(task_id: str, fields: dict) -> dict:
         # Queued as the edit itself, not as the finished object: replaying it
         # re-fetches the task, so a change made elsewhere in the meantime
         # survives everything this edit did not touch.
-        queue_write("update", {"taskId": task_id, "fields": fields}, str(error))
+        queue_write("update", {"taskId": task_id, "fields": fields}, str(error), getattr(error, "session", None))
         holder["task"] = {"id": task_id, "queued": True}
     return holder["task"]
 
@@ -1533,6 +2028,8 @@ def toggle_subtask(task_id: str, item_id: str) -> dict:
         task = dict(find_task(task_id, session))
         if not flip_subtask(task, item_id):
             raise TickTickError(f"Task {task_id} has no subtask {item_id}")
+        if session.get("backend") == "openapi":
+            holder["target"] = next(dict(item) for item in task["items"] if item.get("id") == item_id)
         task["modifiedTime"] = now_api_time()
         holder["item"] = {"id": item_id}
         return batch_task(session, update=[task])
@@ -1545,7 +2042,18 @@ def toggle_subtask(task_id: str, item_id: str) -> dict:
         # Queued as the flip itself. Replaying re-fetches the task and toggles
         # whatever that subtask says now, so two rapid offline flips cancel
         # out on the server exactly as they did on screen.
-        queue_write("subtask", {"taskId": task_id, "itemId": item_id}, str(error))
+        session = getattr(error, "session", None)
+        payload = {"taskId": task_id, "itemId": item_id}
+        if session and session.get("backend") == "openapi":
+            if "target" not in holder:
+                # The lookup itself failed. Base the desired checkbox on the
+                # visible cache instead of guessing the server's state.
+                task = cached_task(task_id)
+                if not flip_subtask(task, item_id):
+                    raise TickTickError("Checkbox is absent from the cache; sync before retrying") from None
+                holder["target"] = next(dict(item) for item in task["items"] if item.get("id") == item_id)
+            payload["item"] = holder["target"]
+        queue_write("subtask", payload, str(error), session)
         holder["item"] = {"id": item_id, "queued": True}
     return holder["item"]
 
@@ -1554,6 +2062,8 @@ def delete_task(task_id: str) -> dict:
     """Remove a task outright. v2 wants the project id alongside the task id."""
     def call(session):
         task = find_task(task_id, session)
+        if session.get("backend") == "openapi":
+            return request("DELETE", f"/project/{_api_id(task.get('projectId'))}/task/{_api_id(task_id)}", session)
         return request(
             "POST",
             "/batch/task",
@@ -1598,16 +2108,30 @@ def create_task(
         task.update(due_fields(due, time_value))
 
     def call(session):
+        if session.get("backend") == "openapi":
+            if not project_id:
+                raise TickTickError("The Open API exposes no inbox ID; choose a project with --project to add a task")
+            task["projectId"] = project_id
+            task.update(openapi_create_task(session, task))
+            return task
         return batch_task(session, add=[task])
 
     try:
         with_session(call)
     except TickTickError as error:
+        session = getattr(error, "session", None)
+        if (session and session.get("backend") == "openapi"
+                and (error.transient or error.needs_review)):
+            queue_write("add", {"task": task, "needsReview": True}, str(error), session)
+            raise TickTickError(
+                "Task creation could not be confirmed. The task was saved in the outbox for review; "
+                "check TickTick before adding it again. Automatic retry could duplicate it.",
+                needs_review=True,
+            ) from None
         if not error.transient:
             raise
-        # The id was generated here, so replaying this later updates the same
-        # task rather than creating a duplicate.
-        queue_write("add", {"task": task}, str(error))
+        # Legacy v2 preserves this client id, so replay targets the same task.
+        queue_write("add", {"task": task}, str(error), session)
         task["queued"] = True
     return task
 
@@ -1705,6 +2229,13 @@ def due_fields(due: str, time_value: str | None = None) -> dict:
 
 
 def query_checkin(session: dict, habit_id: str, stamp: int) -> dict | None:
+    if session.get("backend") == "openapi":
+        rows = request("GET", "/habit/checkins", session,
+                       params={"habitIds": habit_id, "from": stamp, "to": stamp})
+        for entry in normalize_openapi_checkins(rows).get(habit_id, []):
+            if entry["checkinStamp"] == stamp:
+                return entry
+        return None
     after = date_stamp(datetime.strptime(str(stamp), "%Y%m%d") - timedelta(days=1))
     response = request(
         "POST",
@@ -1724,15 +2255,29 @@ def check_in(habit: dict, stamp: int, value: float | None, toggle: bool) -> dict
     goal = float(habit.get("goal") or 1)
     step = float(habit.get("step") or goal or 1)
 
+    pending = {}
+
     def call(session):
-        existing = query_checkin(session, habit_id, stamp)
+        official = session.get("backend") == "openapi"
+        read_error = None
+        try:
+            existing = query_checkin(session, habit_id, stamp)
+        except TickTickError as error:
+            if not official or not error.transient:
+                raise
+            cache = _read_json(DATA_PATH)
+            if cache.get("cacheOwner") != session_owner(session):
+                raise
+            existing = next((item for item in cache.get("checkins", {}).get(habit_id, [])
+                             if item.get("checkinStamp") == stamp), None)
+            read_error = error
         current = float(existing.get("value") or 0) if existing else 0.0
 
-        if toggle and existing and float(existing.get("status") or 0) == CHECKIN_DONE:
+        if toggle and existing and (current >= goal if official else float(existing.get("status") or 0) == CHECKIN_DONE):
             new_value = 0.0
         elif value is not None:
             new_value = float(value)
-        elif habit.get("type") == "Real":
+        elif habit.get("type") == "Real" or official:
             # A quantified habit advances by its own step, so repeat clicks
             # walk 1/3, 2/3, 3/3 instead of jumping straight to complete.
             new_value = min(current + step, goal) if current < goal else 0.0
@@ -1748,6 +2293,13 @@ def check_in(habit: dict, stamp: int, value: float | None, toggle: bool) -> dict
             "value": new_value,
             "status": CHECKIN_DONE if new_value >= goal else CHECKIN_UNCHECKED,
         }
+        pending["entry"] = entry
+        if read_error is not None:
+            raise read_error
+        if official:
+            request("POST", f"/habit/{_api_id(habit_id)}/checkin", session,
+                    payload=openapi_checkin_body(entry))
+            return entry
 
         payload = {"add": [], "update": [], "delete": []}
         if existing and existing.get("id"):
@@ -1774,7 +2326,12 @@ def check_in(habit: dict, stamp: int, value: float | None, toggle: bool) -> dict
             "value": value if value is not None else goal_value,
             "status": CHECKIN_DONE,
         }
-        queue_write("checkin", {"entry": entry}, str(error))
+        session = getattr(error, "session", None)
+        if session and session.get("backend") == "openapi":
+            if "entry" not in pending:
+                raise TickTickError("Could not read the current habit value; retry after syncing") from None
+            entry = pending["entry"]
+        queue_write("checkin", {"entry": entry}, str(error), session)
         entry["queued"] = True
     return entry
 
@@ -1842,23 +2399,137 @@ def connect_with_token(raw_token: str, session: dict, email: str = "") -> dict:
         "savedAt": int(time.time() * 1000),
         "source": "browser-cookie",
     }
-    state = fetch_state(candidate)
-    _write_private(TOKEN_PATH, candidate)
-    write_cache(state)
+    with account_lock():
+        ensure_session_switch_safe(candidate)
+        state = fetch_state(candidate)
+        store_connection(candidate, state)
     return state
 
 
+def store_connection(candidate: dict, state: dict) -> None:
+    # Called under account_lock. Prepare the cache before publishing the
+    # credential, so a failed cache write cannot leave a connected session.
+    previous = _read_json(DATA_PATH)
+    try:
+        _write_private(DATA_PATH, state)
+        for entry in read_outbox():
+            apply_locally(entry["kind"], entry.get("payload") or {})
+        _write_private(TOKEN_PATH, candidate)
+    except OSError:
+        with contextlib.suppress(OSError):
+            _write_private(DATA_PATH, previous)
+        raise TickTickError("Cannot save the TickTick connection; check state-directory permissions and free space") from None
+
+
+def connect_with_api_token(raw_token: str, source: str = "api-token", token_response: dict | None = None) -> dict:
+    token = raw_token.strip() if isinstance(raw_token, str) else ""
+    if not _valid_token(token):
+        raise TickTickError("That API token is empty or malformed; paste only the access token")
+    response = token_response or {}
+    if str(response.get("token_type", "Bearer")).lower() != "bearer":
+        raise TickTickError("TickTick returned an unsupported token type")
+    candidate = {"backend": "openapi", "source": source, "token": token,
+                 "savedAt": int(time.time() * 1000)}
+    if source == "oauth":
+        candidate["clientId"] = response.get("client_id", "")
+        if "expires_in" in response:
+            try:
+                seconds = int(response["expires_in"])
+                if seconds <= 0:
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                raise TickTickError("TickTick returned an invalid token lifetime") from None
+            candidate["expiresAt"] = candidate["savedAt"] + seconds * 1000
+    with account_lock():
+        ensure_session_switch_safe(candidate)
+        state = fetch_state(candidate)
+        state["queued"] = len(read_outbox())
+        store_connection(candidate, state)
+    return state
+
+
+def cmd_oauth_login(args) -> int:
+    # runpy/SourceFileLoader do not add the CLI's directory to sys.path.
+    local_bin = os.path.dirname(os.path.realpath(__file__))
+    if local_bin not in sys.path:
+        sys.path.insert(0, local_bin)
+    events = getattr(args, "json_events", False)
+    browser_opened = False
+
+    def emit(event):
+        nonlocal browser_opened
+        phase = event.get("phase")
+        if phase not in ("preparing", "waiting", "validating"):
+            raise TickTickError("Unexpected TickTick authorization phase")
+        safe = {"phase": phase}
+        if phase == "waiting":
+            url = event.get("url", "")
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme != "https" or parsed.netloc != "ticktick.com" or parsed.path != "/oauth/authorize":
+                raise TickTickError("TickTick returned an unsafe authorization URL")
+            # Only authorization parameters belong in this public event.
+            if any(key in urllib.parse.parse_qs(parsed.query) for key in
+                   ("access_token", "token", "code", "code_verifier", "client_secret")):
+                raise TickTickError("TickTick returned an unsafe authorization URL")
+            safe["url"] = url
+            if not events and not browser_opened:
+                import subprocess
+                try:
+                    subprocess.run(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=10, check=True)
+                except (OSError, subprocess.SubprocessError):
+                    raise TickTickError("Could not open the browser for TickTick authorization") from None
+                browser_opened = True
+        if events:
+            print(json.dumps(safe), flush=True)
+
+    try:
+        from ticktick_oauth import authorize, OAuthError
+    except ImportError:
+        error = TickTickError("TickTick browser authorization module is unavailable")
+        if events:
+            print(json.dumps({"phase": "error", "code": "oauth_unavailable", "message": str(error)}), flush=True)
+            return 1
+        raise error from None
+    try:
+        # A new OAuth credential cannot prove account identity until consent.
+        # Without a documented identity endpoint, do not migrate queued work.
+        if read_outbox():
+            raise TickTickError("Sync pending changes with the current TickTick connection before browser sign-in; cache and outbox preserved")
+        response = authorize(emit, timeout=180)
+        if not isinstance(response, dict):
+            raise TickTickError("TickTick authorization returned no access token")
+        connect_with_api_token(response.get("access_token"), "oauth", response)
+    except (OAuthError, TickTickError) as error:
+        if events:
+            code = error.code if isinstance(error, OAuthError) else ("auth_required" if error.auth_required else "connection_failed")
+            print(json.dumps({"phase": "error", "code": code, "message": str(error)}), flush=True)
+            return 1
+        raise TickTickError(str(error)) from None
+    if events:
+        print(json.dumps({"phase": "connected", "ok": True}), flush=True)
+    else:
+        print("Connected to TickTick.")
+    return 0
+
+
 def cmd_login(args) -> int:
+    if getattr(args, "oauth", False):
+        return cmd_oauth_login(args)
+    if getattr(args, "json_events", False):
+        raise TickTickError("--json-events requires --oauth")
     session = load_session()
 
-    if getattr(args, "token_stdin", False) or getattr(args, "token_file", None):
-        if getattr(args, "token_stdin", False):
+    api_token = getattr(args, "api_token_stdin", False)
+    if api_token or getattr(args, "token_stdin", False) or getattr(args, "token_file", None):
+        if api_token or getattr(args, "token_stdin", False):
             raw_token = sys.stdin.readline(4097)
             if len(raw_token) > 4096:
                 raise TickTickError("Token handoff is too large")
         else:
             raw_token = consume_token_file(args.token_file)
-        state = connect_with_token(raw_token, session, args.email or "")
+        state = (connect_with_api_token(raw_token) if api_token else
+                 connect_with_token(raw_token, session, args.email or ""))
         print(json.dumps({
             "ok": True,
             "tasks": len(state["tasks"]),
@@ -1889,11 +2560,13 @@ def cmd_login(args) -> int:
     if not password:
         raise TickTickError("A password is required")
 
-    session = sign_in(email, password, session)
-    _write_private(TOKEN_PATH, session)
-
-    state = fetch_state(session)
-    write_cache(state)
+    with account_lock():
+        if read_outbox():
+            raise TickTickError("Sync pending changes with the current connection before signing in")
+        # Password sign-in is always the explicit legacy backend.
+        session = sign_in(email, password, {"deviceId": device_id(session)})
+        state = fetch_state(session)
+        store_connection(session, state)
     print(
         f"Signed in as {email}: {len(state['tasks'])} open tasks, {len(state['habits'])} habits."
     )
@@ -1901,11 +2574,14 @@ def cmd_login(args) -> int:
 
 
 def cmd_logout(_args) -> int:
-    for path in (TOKEN_PATH, DATA_PATH, OUTBOX_PATH):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    with account_lock():
+        if read_outbox():
+            raise TickTickError("Pending TickTick changes must be synced before logout; cache and outbox preserved")
+        for path in (TOKEN_PATH, DATA_PATH, OUTBOX_PATH):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     print("Signed out of TickTick.")
     return 0
 
@@ -2089,6 +2765,66 @@ def cmd_status(_args) -> int:
     return 0
 
 
+def _outbox_needs_review(entry) -> bool:
+    return (isinstance(entry, dict) and isinstance(entry.get("payload"), dict)
+            and entry["payload"].get("needsReview") is True)
+
+
+def cmd_outbox(_args) -> int:
+    """Inspect local intent, never credentials or arbitrary provider errors."""
+    rows = []
+    with account_lock():
+        token = load_session().get("token")
+        cache = _read_json(DATA_PATH)
+        tasks = {task.get("id"): task.get("title", "") for task in cache.get("tasks", [])
+                 if isinstance(task, dict) and isinstance(task.get("id"), str)}
+        for raw in read_outbox():
+            entry = raw if isinstance(raw, dict) else {}
+            payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+            kind = entry.get("kind")
+            if kind not in ("add", "complete", "reopen", "update", "subtask", "checkin", "pomo"):
+                kind = "unknown"
+            task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+            fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+            task_id = payload.get("taskId")
+            title = (task.get("title") or fields.get("title")
+                     or (tasks.get(task_id) if isinstance(task_id, str) else "")
+                     or ("Focus session" if kind == "pomo" else ""))
+            title = title if isinstance(title, str) else ""
+            entry_id = entry.get("id")
+            if (not isinstance(entry_id, str) or len(entry_id) != 24
+                    or any(char not in "0123456789abcdef" for char in entry_id)):
+                entry_id = ""
+            for secret in (token, entry.get("owner")):
+                if isinstance(secret, str) and secret:
+                    title = title.replace(secret, "[redacted]")
+                    if entry_id == secret:
+                        entry_id = ""
+            review = _outbox_needs_review(entry)
+            rows.append({"id": entry_id, "kind": kind, "title": title[:256], "needsReview": review,
+                         # Historical lastError can contain untrusted replies.
+                         "error": ("Unconfirmed write; check TickTick before discarding" if review
+                                   else "Pending write; sync with its original connection")})
+    print(json.dumps({"entries": rows}))
+    return 0
+
+
+def cmd_discard_reviewed(args) -> int:
+    if not args.confirm:
+        raise TickTickError("Check the reviewed writes in TickTick, then pass --confirm to discard only review entries")
+    try:
+        with account_lock():
+            entries = read_outbox()
+            remaining = [entry for entry in entries if not _outbox_needs_review(entry)]
+            discarded = len(entries) - len(remaining)
+            if discarded:
+                write_outbox(remaining)
+    except OSError:
+        raise TickTickError("Cannot discard reviewed outbox entries; check private storage permissions and free space") from None
+    print(json.dumps({"ok": True, "discarded": discarded, "remaining": len(remaining)}))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="omarchy-ticktick", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2096,11 +2832,14 @@ def build_parser() -> argparse.ArgumentParser:
     login = sub.add_parser("login", help="authenticate and store a session token")
     login.add_argument("--email")
     tokens = login.add_mutually_exclusive_group()
+    tokens.add_argument("--oauth", action="store_true", help="connect through browser authorization")
+    tokens.add_argument("--api-token-stdin", action="store_true", help="read an official API token from stdin")
     tokens.add_argument("--token-stdin", action="store_true", help="read the token from stdin (used by the panel)")
     tokens.add_argument(
         "--token-file",
         help="private token file inside the credential directory; consumed and deleted",
     )
+    login.add_argument("--json-events", action="store_true", help="stream browser authorization events as NDJSON")
     tokens.add_argument(
         "--token",
         help="session token lifted from the browser's `t` cookie; skips the password login entirely",
@@ -2122,6 +2861,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync.set_defaults(func=cmd_sync)
     sub.add_parser("status", help="print cache state as JSON").set_defaults(func=cmd_status)
+
+    outbox = sub.add_parser("outbox", help="inspect local pending writes without network access")
+    outbox.set_defaults(func=cmd_outbox)
+    outbox_commands = outbox.add_subparsers(dest="outbox_command")
+    discard = outbox_commands.add_parser("discard-reviewed", help="discard only writes explicitly marked for review")
+    discard.add_argument("--confirm", action="store_true", help="confirm you checked TickTick; discarded intent cannot be retried")
+    discard.set_defaults(func=cmd_discard_reviewed)
 
     complete = sub.add_parser("complete", help="mark a task done")
     complete.add_argument("task_id")
@@ -2150,7 +2896,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add = sub.add_parser("add", help="create a task")
     add.add_argument("title")
-    add.add_argument("--project", help="project id; defaults to the inbox")
+    add.add_argument("--project", help="project id; required for Open API, defaults to inbox in legacy mode")
     add.add_argument("--due", help="today, tomorrow, yesterday, or YYYY-MM-DD")
     add.add_argument("--time", help="HH:MM, or HH:MM-HH:MM for a duration")
     add.add_argument(

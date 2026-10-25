@@ -18,6 +18,8 @@ BarWidget {
   // character does not survive every editor and tool that touches this file,
   // and when it is silently dropped the widget renders a bare number.
   readonly property string icon: ""
+  readonly property real iconSize: Style.bar.iconSize || Style.font.body
+  readonly property real iconSlot: Style.bar.iconSlot
 
   readonly property var service: bar && bar.shell && typeof bar.shell.serviceFor === "function"
     ? bar.shell.serviceFor("io.github.sotoaugusto.ticktick")
@@ -35,16 +37,13 @@ BarWidget {
   readonly property bool pomoPaused: panelLoader.item ? panelLoader.item.pomoPaused === true : false
   readonly property bool pomoActive: pomoRunning || pomoPaused
 
-  // An unconnected plugin gets its own glyph rather than a dimmed checklist:
-  // a faint "0 tasks" reads as "nothing to do", which is the opposite of
-  // "needs setup". A plug says which one it is at a glance.
-  readonly property string setupIcon: ""
-
+  // Disconnected state is a muted brand mark, not a text/status badge.
+  // Setup instructions stay in the tooltip and the existing click panel.
   readonly property string activeIcon: !signedIn
-    ? setupIcon
+    ? ""
     : (pomoActive ? "" : icon)
   readonly property string activeLabel: !signedIn
-    ? "setup"
+    ? ""
     : (pomoActive ? pomoClock : panelLabel)
 
   // In "Next" mode the label is a task title, which is as long as someone
@@ -59,7 +58,7 @@ BarWidget {
   readonly property real marqueeWidth: Style.space(150)
 
   readonly property string displayText: activeLabel === "" ? activeIcon : activeIcon + "  " + activeLabel
-  readonly property var verticalLines: activeLabel === "" ? [activeIcon] : [activeIcon, activeLabel]
+  readonly property var verticalLines: !signedIn ? [] : (activeLabel === "" ? [activeIcon] : [activeIcon, activeLabel])
 
   // Right-click cycles what the bar shows, which is how the built-in clock and
   // the calendar plugin let you change their label. Writing it back through
@@ -172,16 +171,14 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: (root.vertical || root.marquee) ? "" : root.displayText
-    fixedWidth: root.marquee ? root.marqueeWidth + Style.space(30) : -1
-    labelVisible: !root.vertical
-    // The marquee draws its own children, so the slot has content even though
-    // the button's own text is empty. Without this the bar treats it as blank
-    // and the widget disappears.
-    hasVisualContent: root.marquee
-      ? true
-      : (root.vertical ? root.verticalLines.length > 0 : text !== "")
-    fixedHeight: root.vertical ? root.verticalLines.length * Style.bar.iconSlot : -1
+    text: (!root.signedIn || root.vertical || root.marquee) ? "" : root.displayText
+    fixedWidth: !root.signedIn ? root.iconSlot
+      : (root.marquee ? root.marqueeWidth + Style.space(30) : -1)
+    labelVisible: root.signedIn && !root.vertical
+    // Custom brand/marquee content still needs a visible, clickable slot.
+    hasVisualContent: !root.signedIn || root.marquee
+      || (root.vertical ? root.verticalLines.length > 0 : text !== "")
+    fixedHeight: root.vertical ? Math.max(1, root.verticalLines.length) * Style.bar.iconSlot : -1
 
     // Late work is the one state worth spending the bar's urgent color on.
     active: root.pomoActive ? root.pomoRunning : root.overdueCount > 0
@@ -191,7 +188,7 @@ BarWidget {
     tooltipText: root.signedIn
       ? (root.hasWork ? "TickTick — click to review" : "TickTick — all clear")
         + "\nright click for " + Model.barLabelDescription(Model.cycleBarLabel(root.barLabelMode))
-      : "TickTick — click to connect"
+      : "TickTick — not connected; click to set up"
 
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.refresh()
@@ -200,6 +197,14 @@ BarWidget {
       // want to change from the bar.
       else if (b === Qt.RightButton) root.cycleBarLabel()
       else root.togglePanel()
+    }
+
+    TickTickIcon {
+      visible: !root.signedIn
+      anchors.centerIn: parent
+      width: root.iconSize
+      height: width
+      color: button.foreground
     }
 
     // Scrolling label. Held to one clip so the glyph stays put and only the
