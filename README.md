@@ -18,7 +18,21 @@ preserving existing legacy connections and settings.
 habits and a focus timer in one popup — add, edit and complete without
 leaving the desktop.
 
-![The TickTick panel: tasks with tag colours, habits with a streak, and a focus timer](preview.png)
+## Screenshots
+
+The actual Omarchy Quattro panel, rendered with synthetic sample tasks and
+habits. These screenshots contain no real account information.
+
+| Tokyo Night | Flexoki Light |
+| --- | --- |
+| <img src="docs/screenshots/panel-dark.png" alt="TickTick tasks, habits and focus timer in Tokyo Night, with sample data" width="360"> | <img src="docs/screenshots/panel-light.png" alt="The same sample tasks, habits and focus timer in Flexoki Light" width="360"> |
+
+<details>
+<summary>Expanded task details and checklist</summary>
+
+<img src="docs/screenshots/task-details.png" alt="An expanded sample task with its description and checklist" width="360">
+
+</details>
 
 The bar shows a count (` 3  2♦` — three tasks due, two habits open) and
 turns urgent when something is late. Left click opens the panel.
