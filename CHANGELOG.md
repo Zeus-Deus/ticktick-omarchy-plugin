@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.1
+
+### Changed
+
+- Refined the theme-native panel without changing its authentication or API
+  backend: larger task and habit titles, a small TickTick header mark, and
+  quieter section spacing.
+- Quick add and its destination list now share one row. Existing list selection,
+  task editing, keyboard shortcuts and date parsing remain available.
+- Secondary text follows the theme foreground at reduced opacity, improving
+  hierarchy on light themes as well as dark ones. Expanded task descriptions
+  retain padding at the right edge.
+- Clarified that the habit count shows habits left, and gave the browser-connect
+  action a subtle theme-accent background.
+
 ## 0.6.0
 
 ### Added

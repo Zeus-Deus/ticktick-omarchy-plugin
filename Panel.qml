@@ -74,7 +74,7 @@ Panel {
   readonly property string defaultProject: String(setting("defaultProject", ""))
   readonly property bool hasDefaultProject: (cache.projects || []).some(function(project) { return String(project.id) === root.defaultProject && !project.closed })
   readonly property bool needsProjectChoice: cache.backend === "openapi" && !hasDefaultProject
-  readonly property var projectOptions: [{ value: "", label: "Choose a quick add list…" }].concat(
+  readonly property var projectOptions: [{ value: "", label: "Choose list…" }].concat(
     (cache.projects || []).filter(function(project) { return project.id && !project.closed }).map(function(project) {
       return { value: String(project.id), label: String(project.name || "Untitled list") }
     }))
@@ -704,7 +704,13 @@ Panel {
   // ---- surface ----------------------------------------------------------
 
   readonly property color fg: Commons.Color.popups.text
-  readonly property color muted: Qt.darker(fg, 1.5)
+  // Secondary text is the theme's own text colour at reduced strength, so it
+  // composites over whatever popup background the theme paints. Darkening
+  // the foreground only works on dark themes; on a light one it made
+  // "secondary" text stronger than the primary.
+  readonly property color muted: Qt.rgba(fg.r, fg.g, fg.b, 0.64)
+  // The one quiet wash used for hover, the cursor row and the primary action.
+  readonly property color accentWash: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.14)
 
   KeyboardPanel {
     id: panel
@@ -783,9 +789,22 @@ Panel {
             width: parent.width
             height: Math.max(headerText.implicitHeight, syncButton.height)
 
+            // Identity without a logo: the same monochrome mark the bar shows
+            // when signed out, painted in the theme's accent at the size of
+            // the two header lines it sits beside.
+            TickTickIcon {
+              id: brandMark
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(20)
+              height: width
+              color: Commons.Color.accent
+            }
+
             Column {
               id: headerText
-              anchors.left: parent.left
+              anchors.left: brandMark.right
+              anchors.leftMargin: Style.space(10)
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(1)
 
@@ -819,10 +838,12 @@ Panel {
                     font.bold: true
                   }
 
-                  // Position dots, not a chevron. A chevron promises a
-                  // dropdown; this cycles. The dots also say how many ranges
+                  // Position marks, not a chevron. A chevron promises a
+                  // dropdown; this cycles. The marks also say how many ranges
                   // there are and which one is showing, which the chevron
-                  // never did.
+                  // never did. They are drawn rather than typed — font dots
+                  // sat on the baseline and changed weight with the theme's
+                  // font — and the current range stretches into a short pill.
                   Row {
                     id: viewDots
                     anchors.verticalCenter: viewLabel.verticalCenter
@@ -832,16 +853,19 @@ Panel {
                     Repeater {
                       model: Model.horizons()
 
-                      Text {
+                      Rectangle {
                         required property int index
                         readonly property bool current: index === Model.horizonIndex(root.viewHorizon)
 
-                        text: current ? "●" : "○"
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: current ? Style.space(12) : Style.space(5)
+                        height: Style.space(5)
+                        radius: height / 2
                         color: current
                           ? (viewSwitch.containsMouse ? Commons.Color.accent : root.fg)
-                          : root.muted
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
+                          : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, viewSwitch.containsMouse ? 0.45 : 0.28)
+
+                        Behavior on width { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
                       }
                     }
                   }
@@ -862,7 +886,13 @@ Panel {
                 }
               }
 
+              // The mark took some of the line, so a long status (queued,
+              // stale) now stops short of the buttons instead of running
+              // under them.
               Text {
+                width: Math.min(implicitWidth,
+                  (queuedBadge.visible ? queuedBadge.x : helpButton.x) - headerText.x - Style.space(6))
+                elide: Text.ElideRight
                 text: root.headerSubtitle()
                 color: root.muted
                 font.family: Style.font.family
@@ -1111,12 +1141,14 @@ Panel {
             Text {
               id: setupLeadText
               width: parent.width
+              topPadding: Style.space(2)
               wrapMode: Text.WordWrap
+              lineHeight: 1.15
               text: root.setupLead()
               textFormat: Text.PlainText
               color: root.fg
               font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
+              font.pixelSize: Style.font.body
             }
 
             Text {
@@ -1132,6 +1164,9 @@ Panel {
               font.pixelSize: Style.font.caption
             }
 
+            // The card's one primary action, so it is the one filled surface
+            // on it: the accent wash says "this is the way in" without a
+            // brand colour the theme never chose.
             Button {
               id: connectButton
               width: parent.width
@@ -1140,7 +1175,8 @@ Panel {
               bordered: true
               text: root.connectLabel()
               foreground: Commons.Color.accent
-              fontSize: Style.font.bodySmall
+              background: root.accentWash
+              fontSize: Style.font.body
               onClicked: root.connectTickTick()
             }
 
@@ -1260,17 +1296,53 @@ Panel {
             }
           }
 
-          // ---- quick add. The official API requires a real destination list.
-          Dropdown {
-            id: projectPicker
+          // ---- quick add. One line: what to add, and where it lands. The
+          //      official API requires a real destination list, so the list
+          //      rides beside the field as its destination rather than
+          //      stacking a labelled form above it. Without the official
+          //      backend there is no picker and the field takes the row.
+          Row {
+            id: quickAddRow
             width: parent.width
-            visible: root.signedIn && root.showTasks && root.cache.backend === "openapi"
-            label: "Quick add list"
-            value: root.hasDefaultProject ? root.defaultProject : ""
-            options: root.projectOptions
-            foreground: root.fg
-            enabled: root.projectOptions.length > 1
-            onChanged: function(value) { root.chooseProject(value) }
+            spacing: Style.space(6)
+            // The field's own condition, not `quickAdd.visible`: a child
+            // reports itself hidden while its parent is, which would latch.
+            visible: root.signedIn && root.showTasks
+
+            TextField {
+              id: quickAdd
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width - (projectPicker.visible ? projectPicker.width + parent.spacing : 0)
+              visible: root.signedIn && root.showTasks
+              enabled: root.editingTaskId !== "" || !root.needsProjectChoice
+              placeholderText: root.editingTaskId !== ""
+                ? "Enter saves · esc cancels"
+                : (root.needsProjectChoice ? "Choose a list first →" : "Add a task…  #tag  !1")
+              foreground: root.fg
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              onAccepted: root.submitQuickAdd()
+              Keys.onReturnPressed: function(event) { root.quickAddReturn(event) }
+              Keys.onEnterPressed: function(event) { root.quickAddReturn(event) }
+              Keys.onEscapePressed: root.cancelEdit()
+            }
+
+            Dropdown {
+              id: projectPicker
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(124)
+              visible: root.signedIn && root.showTasks && root.cache.backend === "openapi"
+              label: "Quick add list"
+              showLabel: false
+              // One control height across the row, whatever the field's
+              // padding token makes its own.
+              rowHeight: Math.max(Style.spacing.controlHeight, Math.round(quickAdd.height))
+              value: root.hasDefaultProject ? root.defaultProject : ""
+              options: root.projectOptions
+              foreground: root.fg
+              enabled: root.projectOptions.length > 1
+              onChanged: function(value) { root.chooseProject(value) }
+            }
           }
 
           Text {
@@ -1282,23 +1354,6 @@ Panel {
             color: root.muted
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
-          }
-
-          TextField {
-            id: quickAdd
-            width: parent.width
-            visible: root.signedIn && root.showTasks
-            enabled: root.editingTaskId !== "" || !root.needsProjectChoice
-            placeholderText: root.editingTaskId !== ""
-              ? "Editing — enter to save, esc to cancel"
-              : (root.needsProjectChoice ? "Choose a quick add list above…" : "Add a task…  #tag  !1  tomorrow")
-            foreground: root.fg
-            font.family: Style.font.family
-            font.pixelSize: Style.font.bodySmall
-            onAccepted: root.submitQuickAdd()
-            Keys.onReturnPressed: function(event) { root.quickAddReturn(event) }
-            Keys.onEnterPressed: function(event) { root.quickAddReturn(event) }
-            Keys.onEscapePressed: root.cancelEdit()
           }
 
           Text {
@@ -1362,7 +1417,7 @@ Panel {
                   ? root.visibleTasks.length + " · " + root.overdueCount + " LATE"
                   : String(root.visibleTasks.length)
                 foreground: root.overdueCount > 0 && !root.backlogRuleVisible
-                  ? Commons.Color.accent : root.muted
+                  ? Commons.Color.accent : root.fg
               }
             }
 
@@ -1421,7 +1476,7 @@ Panel {
                     anchors.rightMargin: Style.space(6)
                     anchors.verticalCenter: parent.verticalCenter
                     height: 1
-                    color: Qt.rgba(root.muted.r, root.muted.g, root.muted.b, 0.35)
+                    color: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.3)
                   }
                 }
 
@@ -1563,7 +1618,7 @@ Panel {
                         textFormat: Text.PlainText
                         color: taskRow.tier === "upcoming" ? root.muted : root.fg
                         font.family: Style.font.family
-                        font.pixelSize: Style.font.bodySmall
+                        font.pixelSize: Style.font.body
                         font.bold: Model.priorityRank(taskRow.modelData) === "high"
 
                         readonly property bool overflowing: implicitWidth > titleClip.width
@@ -1656,7 +1711,7 @@ Panel {
                     id: detailColumn
                     visible: taskRow.expanded
                     height: visible ? implicitHeight : 0
-                    width: parent.width - Style.space(30)
+                    width: parent.width - Style.space(36)
                     x: Style.space(30)
                     y: Style.space(26)
                     spacing: Style.space(6)
@@ -1675,7 +1730,8 @@ Panel {
                       // stops mid-sentence is not a description.
                       color: root.muted
                       font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
+                      font.pixelSize: Style.font.bodySmall
+                      lineHeight: 1.15
                     }
 
                     Repeater {
@@ -1745,7 +1801,7 @@ Panel {
                             textFormat: Text.PlainText
                             color: subtaskRow.modelData.done ? root.muted : root.fg
                             font.family: Style.font.family
-                            font.pixelSize: Style.font.bodySmall
+                            font.pixelSize: Style.font.body
                             font.strikeout: subtaskRow.modelData.done
                           }
                         }
@@ -1772,7 +1828,10 @@ Panel {
             spacing: Style.space(4)
             visible: root.signedIn && root.showHabits && root.habits.length > 0
 
-            PanelSeparator { width: parent.width; foreground: root.fg }
+            // One rule divides the field from the lists, above TASKS. Below
+            // it the sections are told apart by their headers and the air
+            // above them; a rule over every header boxed each list in.
+            Item { width: parent.width; height: Style.space(6) }
 
             Item {
               width: parent.width
@@ -1789,7 +1848,7 @@ Panel {
                 anchors.right: parent.right
                 anchors.baseline: sectionLabel_habits.baseline
                 text: root.habitsRemaining > 0 ? root.habitsRemaining + " LEFT" : "DONE"
-                foreground: root.muted
+                foreground: root.fg
               }
             }
 
@@ -1875,7 +1934,7 @@ Panel {
                     textFormat: Text.PlainText
                     color: habitRow.progress.done ? root.muted : root.fg
                     font.family: Style.font.family
-                    font.pixelSize: Style.font.bodySmall
+                    font.pixelSize: Style.font.body
                   }
 
                   Text {
@@ -1897,7 +1956,7 @@ Panel {
             spacing: Style.space(4)
             visible: root.signedIn && root.showPomo
 
-            PanelSeparator { width: parent.width; foreground: root.fg }
+            Item { width: parent.width; height: Style.space(6) }
 
             Item {
               width: parent.width
@@ -1914,7 +1973,7 @@ Panel {
                 anchors.right: parent.right
                 anchors.baseline: sectionLabel_focus.baseline
                 text: Model.pomoTodayLabel(root.pomoStats, root.pomoPrefs).toUpperCase()
-                foreground: root.muted
+                foreground: root.fg
               }
             }
 
@@ -2070,7 +2129,8 @@ Panel {
 
     var parts = []
     if (showTasks) parts.push(visibleTasks.length + (visibleTasks.length === 1 ? " task" : " tasks"))
-    if (showHabits && habits.length > 0) parts.push(habitsRemaining + " of " + habits.length + " habits")
+    // "2 of 2 habits" read as two done; the count is of what is still open.
+    if (showHabits && habits.length > 0) parts.push(habitsRemaining + " of " + habits.length + " habits left")
 
     if (queuedCount > 0) parts.push(queuedCount + " waiting to send")
 
